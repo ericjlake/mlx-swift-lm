@@ -34,6 +34,29 @@ import MLX
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
 /// - Returns: Attention output [B, nHeads, L, D]
+/// Fallback for scaledDotProductAttention when running on a CPU device
+private func fallbackScaledDotProductAttention(
+    queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray {
+    // Handle Grouped Query Attention (GQA) / Multi-Query Attention (MQA)
+    var k = keys
+    var v = values
+    let qHeads = queries.dim(1)
+    let kHeads = keys.dim(1)
+    if qHeads > kHeads {
+        let repeats = qHeads / kHeads
+        k = MLX.repeated(k, count: repeats, axis: 1)
+        v = MLX.repeated(v, count: repeats, axis: 1)
+    }
+
+    var scores = (queries * scale).matmul(k.transposed(0, 1, 3, 2))
+    if let maskArray = mask.mask {
+        scores = scores + maskArray
+    }
+    let softMaxScores = MLX.softmax(scores.asType(.float32), axis: -1).asType(scores.dtype)
+    return matmul(softMaxScores, v)
+}
+
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
@@ -42,7 +65,14 @@ public func attentionWithCacheUpdate(
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
 ) -> MLXArray {
+    let isCPU = Device.defaultDevice().deviceType == .cpu
+
+
     guard let cache else {
+        if isCPU {
+            return fallbackScaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: keys,
@@ -52,6 +82,9 @@ public func attentionWithCacheUpdate(
         )
     }
     if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+        if isCPU {
+            fatalError("[metal_kernel] Quantized KV Cache partitioning is only supported on GPU.")
+        }
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(
@@ -66,6 +99,10 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        if isCPU {
+            return fallbackScaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale, mask: mask)
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,

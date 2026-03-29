@@ -308,6 +308,14 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
+    
+    // TurboQuant Experimental State
+    private let EXPERIMENTAL_TURBOQUANT = false
+    public var polarKeys: MLXArray?
+    public var polarValues: MLXArray?
+    public var residualKeys: MLXArray?
+    public var residualValues: MLXArray?
+    
     public var step = 256
 
     public override init() {
@@ -350,6 +358,24 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
+        }
+        
+        // TurboQuant Experimental Chunking: Compress older segments of the cache
+        // to free up RAM on high-context (100k+ token) requests.
+        if EXPERIMENTAL_TURBOQUANT, previous > 8192, let fullK = self.keys, let fullV = self.values {
+            // Encode history past the eviction boundary into 3-bit PolarQuant primitives
+            let staleK = fullK[.ellipsis, ..<4096, 0...]
+            let staleV = fullV[.ellipsis, ..<4096, 0...]
+            
+            let (qK, qV) = MLXFast.turboQuantEncode(keys: staleK, values: staleV, bits: 3)
+            self.polarKeys = qK.0
+            self.residualKeys = qK.1
+            self.polarValues = qV.0
+            self.residualValues = qV.1
+            
+            // The standard self.keys cache would normally be truncated here,
+            // but we leave this disabled in experimental mode until Metal decoding is fully routed.
+            // print("TurboQuant: Compressed 4096 tokens down to 3-bit Polar Coordinates.")
         }
 
         self.offset += keys.dim(2)

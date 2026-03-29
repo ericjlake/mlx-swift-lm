@@ -88,6 +88,18 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // EXPERIMENTAL_SSD_STREAM: Initialize the ExpertStreamerManager.
+    // The streamer handles on-demand SSD reads during inference.
+    // NOTE: We intentionally do NOT shed weights during loading — the model needs
+    // all expert weights properly loaded and quantized. The 60GB of expert weights
+    // ARE loaded via mmap (memory-mapped files), but they are NOT paged into RAM
+    // until accessed. macOS's lazy mmap means only the dense weights + active
+    // expert slabs are in physical RAM at any one time.
+    let streamEnv = getenv("EXPERIMENTAL_SSD_STREAM")
+    if let envPtr = streamEnv, String(cString: envPtr) != "" {
+        ExpertStreamerManager.shared = ExpertStreamerManager(modelDirectory: modelDirectory)
+    }
+
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in
@@ -106,6 +118,15 @@ public func loadWeights(
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
+
+    if let envPtr = getenv("EXPERIMENTAL_SSD_STREAM"), String(cString: envPtr) != "" {
+        // Pass the tensorName to each QuantizedSwitchLinear layer dynamically
+        for (path, module) in model.leafModules().flattened() {
+            if let qsl = module as? QuantizedSwitchLinear {
+                qsl.tensorName = "\(path).weight"
+            }
+        }
+    }
 
     if !lazyLoad {
         eval(model)

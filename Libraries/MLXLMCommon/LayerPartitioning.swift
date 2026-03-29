@@ -102,11 +102,14 @@ public func partitionedLayerCall<T>(
     index: Int,
     gpuLayerCount: Int?,
     stream: Bool = false,
+    cacheToEval: KVCache? = nil,
     body: () -> T
 ) -> T {
     let result: T
     
-    if let gpuCount = gpuLayerCount, index >= gpuCount {
+    let isSsdStream = getenv("EXPERIMENTAL_SSD_STREAM") != nil
+    
+    if let gpuCount = gpuLayerCount, index >= gpuCount, !isSsdStream {
         // CPU layer — scope the computation to the CPU device
         result = Device.withDefaultDevice(.cpu, body)
     } else {
@@ -114,13 +117,41 @@ public func partitionedLayerCall<T>(
         result = body()
     }
     
+    // ─── WATCHDOG BYPASS ──────────────────────────────────────────────────────
+    // When SSD streaming is active, we ALWAYS flush the GPU command buffer after
+    // each layer, regardless of whether this is a MoE layer. Without this, the
+    // GatedDeltaNet custom Metal kernels on 3 consecutive linear-attention layers
+    // accumulate into one oversized command buffer that exceeds the 5-second
+    // Apple GPU Watchdog limit → kIOGPUCommandBufferCallbackErrorTimeout.
+    //
+    // This is the authoritative fix. The per-layer sync inside DecoderLayer.callAsFunction
+    // is intentionally redundant (belt-and-suspenders) and can be removed later.
+    // ─────────────────────────────────────────────────────────────────────────
+    if isSsdStream, let array = result as? MLXArray {
+        if let cache = cacheToEval {
+            var itemsToEval = cache.state
+            itemsToEval.append(array)
+            eval(itemsToEval)
+        } else {
+            eval(array)
+        }
+        Stream.gpu.synchronize()
+        return result
+    }
+    
     if stream, let array = result as? MLXArray {
-        // 1. Force evaluation of this single layer.
-        // The router hits K experts. The OS pages ONLY those K experts from SSD to RAM.
-        eval(array)
+        // 1. Force evaluation of this single layer state.
+        if let cache = cacheToEval {
+            var itemsToEval = cache.state
+            itemsToEval.append(array)
+            eval(itemsToEval)
+            Stream.gpu.synchronize()
+        } else {
+            eval(array)
+            Stream.gpu.synchronize()
+        }
         
         // 2. Clear MLX's internal Metal buffer pool.
-        // This ensures temporary buffers don't push the Attention weights out of the OS page cache.
         GPU.clearCache()
     }
     

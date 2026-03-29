@@ -289,7 +289,8 @@ func gatedDeltaUpdate(
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    let isCPU = Device.defaultDevice().deviceType == .cpu
+    if !isCPU, GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

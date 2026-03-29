@@ -62,7 +62,11 @@ public class SwitchGLU: Module {
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
-        let doSort = indices.size >= 64
+        // We must force sorting/flattening when SSD streaming is active to properly batch
+        // expert kernel dispatches dynamically over contiguous arrays.
+        let isSSDStreaming = ProcessInfo.processInfo.environment["EXPERIMENTAL_SSD_STREAM"] != nil
+        if isSSDStreaming { MLX.eval(indices) }
+        let doSort = (indices.size >= 64) || isSSDStreaming
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -154,6 +158,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
+    public var tensorName: String?
 
     public init(
         _ other: SwitchLinear, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
@@ -178,7 +183,75 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
-        var result = MLX.gatherQuantizedMM(
+        var result: MLXArray
+        
+        // SSD Streaming: if EXPERIMENTAL_SSD_STREAM is set, route expert GEMMs through the
+        // GCD dispatch_io → MTLSharedEvent → GPU hardware pipeline.
+        // wShape uses logical (unquantized) dims so moe_stream_op computes output shape correctly:
+        //   shape(0)=numExperts, shape(1)=outputDims, shape(2)=inputDims
+        if let envPtr = getenv("EXPERIMENTAL_SSD_STREAM"), let _ = String(cString: envPtr) as String? {
+           if let tensorName = self.tensorName {
+               if let filename = ExpertStreamerManager.shared?.getFile(for: tensorName) {
+                    let ssdPath = URL(fileURLWithPath: String(cString: envPtr)).appendingPathComponent(filename).path
+                    
+                    // X is already sorted and flattened by gatherSort in SwitchGLU to [N, 1, 1, inputDims]
+                    // We just need to segment the sequence into contiguous chunks per expert
+            
+            
+            MLX.eval(indices)
+            if indices.size == 0 {
+                var outShape = x.shape
+                outShape[outShape.count - 1] = self.outputDims
+                return MLXArray.zeros(outShape).asType(.float16)
+            }
+            
+            let cpuIndices = indices.asArray(UInt32.self)
+            
+            var expertResults = [MLXArray]()
+            // Broadcast a scalar zero to the required shape to avoid allocating gigabytes of zeros
+            let wShape = MLX.broadcast(MLXArray(0.0), to: [self.numExperts, self.outputDims, self.inputDims])
+            
+            var startIdx = 0
+            while startIdx < cpuIndices.count {
+                let currentExpert = cpuIndices[startIdx]
+                var endIdx = startIdx + 1
+                while endIdx < cpuIndices.count && cpuIndices[endIdx] == currentExpert {
+                    endIdx += 1
+                }
+                
+                // Slice X across the 0th axis (batch dimension)
+                let rangeX = x[startIdx ..< endIdx]
+                
+                let expertOutput = MLXFast.streamedGatherMM(
+                    x: rangeX.asType(.float16),
+                    wShape: wShape,
+                    activeExpert: currentExpert,
+                    safetensorsPath: ssdPath,
+                    tensorName: tensorName
+                )
+                
+                expertResults.append(expertOutput)
+                
+                startIdx = endIdx
+            }
+            
+            if expertResults.isEmpty {
+                var outShape = x.shape
+                outShape[outShape.count - 1] = self.outputDims
+                return MLXArray.zeros(outShape).asType(.float16)
+            }
+            
+            let concatedResults = MLX.concatenated(expertResults, axis: 0)
+            return concatedResults.asType(.float16)
+               } else {
+                   print("[SSD_STREAM] WARNING: filename is nil for tensorName: \(tensorName)")
+               }
+           } else {
+               print("[SSD_STREAM] WARNING: self.tensorName is nil!")
+           }
+        }
+        
+        result = MLX.gatherQuantizedMM(
             x,
             self.weight,
             scales: self.scales,
@@ -196,5 +269,26 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         }
 
         return result
+    }
+}
+
+public class ExpertStreamerManager {
+    public static var shared: ExpertStreamerManager?
+
+    public let weightMap: [String: String]
+
+    public init(modelDirectory: URL) {
+        var map = [String: String]()
+        let indexUrl = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+        if let data = try? Data(contentsOf: indexUrl),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let weightMapJson = json["weight_map"] as? [String: String] {
+            map = weightMapJson
+        }
+        self.weightMap = map
+    }
+
+    public func getFile(for tensorName: String) -> String? {
+        return weightMap[tensorName]
     }
 }

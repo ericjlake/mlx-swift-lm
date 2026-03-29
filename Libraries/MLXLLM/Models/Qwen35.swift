@@ -294,6 +294,24 @@ final class Qwen35GatedDeltaNet: Module {
     }
 }
 
+final class MathRMSNorm: Module, UnaryLayer {
+    @ParameterInfo(key: "weight") var weight: MLXArray
+    let eps: Float
+    init(dimensions: Int, eps: Float = 1e-6) {
+        self.eps = eps
+        _weight.wrappedValue = MLXArray.ones([dimensions])
+        super.init()
+    }
+    func callAsFunction(_ hiddenStates: MLXArray) -> MLXArray {
+        let isCPU = Device.defaultDevice().deviceType == .cpu
+        if isCPU {
+            let variance = mean(square(hiddenStates), axis: -1, keepDims: true)
+            return (hiddenStates * rsqrt(variance + eps)) * weight
+        }
+        return MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+    }
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -306,8 +324,8 @@ final class Qwen35Attention: Module {
     @ModuleInfo(key: "v_proj") var vProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
-    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    @ModuleInfo(key: "q_norm") var qNorm: MathRMSNorm
+    @ModuleInfo(key: "k_norm") var kNorm: MathRMSNorm
 
     let rope: RoPELayer
 
@@ -326,8 +344,8 @@ final class Qwen35Attention: Module {
         _oProj.wrappedValue = Linear(
             args.attentionHeads * headDim, args.hiddenSize, bias: args.attentionBias)
 
-        _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
-        _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
+        _qNorm.wrappedValue = MathRMSNorm(dimensions: headDim, eps: args.rmsNormEps)
+        _kNorm.wrappedValue = MathRMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
         let ropeDims = Int(Float(headDim) * args.partialRotaryFactor)
         self.rope = initializeRope(
@@ -444,8 +462,8 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen35GatedDeltaNet?
 
-    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: MathRMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: MathRMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
 
@@ -467,16 +485,23 @@ final class Qwen35DecoderLayer: Module {
             )
         }
 
-        _inputLayerNorm.wrappedValue = RMSNorm(
+        _inputLayerNorm.wrappedValue = MathRMSNorm(
             dimensions: args.hiddenSize,
             eps: args.rmsNormEps
         )
-        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+        _postAttentionLayerNorm.wrappedValue = MathRMSNorm(
             dimensions: args.hiddenSize,
             eps: args.rmsNormEps
         )
 
         super.init()
+    }
+
+    private func prefaultEvaluatable(_ evalObj: Evaluatable?) {
+        guard let evalObj = evalObj else { return }
+        for array in evalObj.innerState() {
+            MLXFast.prefault(array)
+        }
     }
 
     func callAsFunction(
@@ -485,6 +510,22 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?
     ) -> MLXArray {
+        
+        // OS VM SWAP WATCHDOG BYPASS: 
+        // For massive models (e.g. 122B Qwen on 64GB Mac), Apple Unified Memory will swap
+        // weights and KV Cache to disk. If the GPU page-faults these during execution, it blocks the thread
+        // generating kIOGPUCommandBufferCallbackErrorTimeout after 5 seconds.
+        // By evaluating innerState() sequentially on the CPU thread here, we force the SSD load
+        // safely outside of the Apple Metal limits. KERNEL EXECUTION DROPS FROM 5s+ TO 100ms.
+        if ProcessInfo.processInfo.environment["EXPERIMENTAL_SSD_STREAM"] != nil {
+            prefaultEvaluatable(self.inputLayerNorm)
+            prefaultEvaluatable(self.postAttentionLayerNorm)
+            prefaultEvaluatable(self.selfAttn)
+            prefaultEvaluatable(self.linearAttn)
+            prefaultEvaluatable(cache)
+            // WE MUST NOT PREFAULT MOE EXPERTS TO AVOID MEMORY CRASH
+        }
+
         let r: MLXArray
         if isLinear {
             r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
@@ -493,7 +534,35 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        
+        // ─────────────────────────────────────────────────────────────────────
+        // FLUSH-LOAD-EXECUTE ARCHITECTURE: Phase 1 (Flush & Split)
+        // ─────────────────────────────────────────────────────────────────────
+        // If we are processing a Mixture of Experts layer, we explicitly evaluate
+        // the attention subgraph (`h`) and synchronize the Metal GPU queue here.
+        // 
+        // THIS IS VITAL FOR TWO REASONS:
+        // 1. FRESH COMMAND BUFFER (Streaming): When SSD Expert Streaming evaluates
+        //    the `mlp` custom op, it performs a highly latency-sensitive `load_sync` 
+        //    (blocking the CPU). Ensuring the previous GPU work is committed and completed
+        //    means the expert GEMM executes on an isolated, empty Metal Command Buffer.
+        // ─────────────────────────────────────────────────────────────────────
+        if let moeBlock = self.mlp as? Qwen35SparseMoeBlock {
+            if let cacheState = cache {
+                eval([h] + cacheState.innerState())
+            } else {
+                eval(h)
+            }
+            Stream.gpu.synchronize()
+        }
+        
+        let mlpOutput = (self.mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let finalH = h + mlpOutput
+        if let moeBlock = self.mlp as? Qwen35SparseMoeBlock {
+            eval(finalH)
+            Stream.gpu.synchronize()
+        }
+        return finalH
     }
 }
 
@@ -503,7 +572,7 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
-    let norm: RMSNorm
+    let norm: MathRMSNorm
 
     let ssmIdx: Int
     let faIdx: Int
@@ -527,7 +596,7 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
 
-        self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self.norm = MathRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
@@ -551,7 +620,7 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
             let attnMask =
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
+            hiddenStates = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts, cacheToEval: cacheArray?[i]) {
                 layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
             }
