@@ -310,7 +310,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var values: MLXArray?
     
     // TurboQuant Experimental State
-    private let EXPERIMENTAL_TURBOQUANT = false
+    // Set to true via --turbo-kv flag (Server.swift) to enable 3-bit PolarQuant
+    // compression of KV cache history when context > 8192 tokens.
+    public var turboQuantEnabled: Bool = false
     public var polarKeys: MLXArray?
     public var polarValues: MLXArray?
     public var residualKeys: MLXArray?
@@ -360,9 +362,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             }
         }
         
-        // TurboQuant Experimental Chunking: Compress older segments of the cache
-        // to free up RAM on high-context (100k+ token) requests.
-        if EXPERIMENTAL_TURBOQUANT, previous > 8192, let fullK = self.keys, let fullV = self.values {
+        // TurboQuant: Compress older segments of the cache to reduce KV RAM on
+        // high-context (100k+ token) requests. Enabled via --turbo-kv at startup.
+        if turboQuantEnabled, previous > 8192, let fullK = self.keys, let fullV = self.values {
             // Encode history past the eviction boundary into 3-bit PolarQuant primitives
             let staleK = fullK[.ellipsis, ..<4096, 0...]
             let staleV = fullV[.ellipsis, ..<4096, 0...]
