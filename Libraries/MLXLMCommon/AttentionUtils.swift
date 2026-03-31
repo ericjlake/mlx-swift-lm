@@ -12,10 +12,17 @@ func _mlxTurboKVRecord(_ tokens: UInt64, _ origBytes: UInt64, _ packedBytes: UIn
 
 enum TurboKVTelemetry {
     /// Feed the 10s log aggregator from the cache compression path.
+    ///
+    /// `keys` and `values` are the packed uint8 arrays just produced by turboQuantEncode.
+    /// Shape: [B, nKVH, newTokens, packedDim]
+    /// origBytes = B × nKVH × newTokens × headDim × 2B (fp16) × 2 (K+V)
     static func logOnce(compressedOffset: Int, keys: MLXArray, values: MLXArray, headDim: Int) {
+        let B         = keys.dim(0)
+        let nKVH      = keys.dim(1)
+        let newTokens = keys.dim(2)    // only the tokens just encoded, not cumulative
         let packedBytes = UInt64(keys.nbytes + values.nbytes)
-        let origBytes   = UInt64(compressedOffset * headDim * 2 * 2)  // K+V fp16
-        _mlxTurboKVRecord(UInt64(compressedOffset), origBytes, packedBytes)
+        let origBytes   = UInt64(B * nKVH * newTokens * headDim * 2 * 2)  // K+V fp16
+        _mlxTurboKVRecord(UInt64(newTokens), origBytes, packedBytes)
     }
 
     /// Feed the 10s log aggregator from the AttentionUtils decode path.
