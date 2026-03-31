@@ -99,14 +99,31 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+
+        // TurboKV: if this cache has compressed history, decode and prepend it.
+        // This makes the full context (compressed history + hot window) visible to SDPA.
+        var fullKeys = cachedKeys
+        var fullValues = cachedValues
+        if let kvCache = cache as? KVCacheSimple,
+           let pk = kvCache.polarKeys,
+           let pv = kvCache.polarValues,
+           kvCache.compressedOffset > 0 {
+            // Decode packed uint8 history → fp32 → model dtype
+            let historyK = MLXFast.turboDecodeK(packed: pk).asType(cachedKeys.dtype)
+            let historyV = MLXFast.turboDecodeV(packed: pv).asType(cachedValues.dtype)
+            // Concatenate: [compressed_history | hot_window] along seq axis (dim 2)
+            fullKeys   = concatenated([historyK, cachedKeys],   axis: 2)
+            fullValues = concatenated([historyV, cachedValues], axis: 2)
+        }
+
         if isCPU {
             return fallbackScaledDotProductAttention(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale, mask: mask)
+                queries: queries, keys: fullKeys, values: fullValues, scale: scale, mask: mask)
         }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
-            keys: cachedKeys,
-            values: cachedValues,
+            keys: fullKeys,
+            values: fullValues,
             scale: scale,
             mask: mask
         )
