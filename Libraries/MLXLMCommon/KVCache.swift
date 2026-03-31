@@ -433,8 +433,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     /// Number of fp16 tokens preserved as a high-quality hot window.
     /// Only tokens older than this boundary are compressed into polarKeys.
-    /// Compression first triggers when offset > turboHotWindowSize + step (i.e. ~1024 tokens).
-    public var turboHotWindowSize: Int = 512
+    /// Compression first triggers when offset > turboHotWindowSize + step (i.e. ~512 tokens).
+    public var turboHotWindowSize: Int = 256
 
 
 
@@ -442,6 +442,23 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public override var state: [MLXArray] {
         get {
+            // When TurboKV is active the fp16 buffer (self.keys) holds only the hot window.
+            // Returning just that would cause the prompt-cache to lose all compressed history,
+            // making every subsequent request that hits the cache see a truncated context.
+            // Fix: decode polarKeys and concatenate with the hot window to form the full fp16 state.
+            if turboQuantEnabled,
+               let pk = polarKeys, let pv = polarValues,
+               compressedOffset > 0,
+               let hotK = self.keys, let hotV = self.values {
+                let histK = MLXFast.turboDecodeK(packed: pk)
+                let histV = MLXFast.turboDecodeV(packed: pv)
+                let hotKSlice = hotK[.ellipsis, ..<offset, 0...]
+                let hotVSlice = hotV[.ellipsis, ..<offset, 0...]
+                return [
+                    concatenated([histK, hotKSlice], axis: 2),
+                    concatenated([histV, hotVSlice], axis: 2),
+                ]
+            }
             guard let keys = self.keys, let values = self.values else { return [] }
             if offset == keys.dim(2) {
                 return [keys, values]
@@ -456,11 +473,19 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             guard newValue.count == 2 else {
                 fatalError("KVCacheSimple state must have exactly 2 arrays (keys, values)")
             }
+            // Clear TurboKV state on restore — the full fp16 context is now in self.keys.
+            // Compression will resume naturally as new tokens push older ones past the hot window.
+            self.polarKeys = nil
+            self.polarValues = nil
+            self.compressedOffset = 0
+            self.residualKeys = nil
+            self.residualValues = nil
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
         }
     }
+
 
     public override var isTrimmable: Bool { true }
 
