@@ -365,10 +365,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         // TurboQuant: Compress older segments of the cache to reduce KV RAM on
         // high-context (100k+ token) requests. Enabled via --turbo-kv at startup.
         if turboQuantEnabled, previous >= 1, let fullK = self.keys, let fullV = self.values {
-            // TurboQuant currently physically hardcodes head_dim=128 in Metal shaders.
-            // Dynamically disable compression if the model architecture differs (e.g., Qwen 122B has 256).
-            if fullK.dim(-1) != 128 {
-                print("[TurboKV] Warning: Model head_dim (\(fullK.dim(-1))) unsupported. TurboKV requires 128. Compression sequence dynamically disabled.")
+            // TurboQuant C++ encoder supports head_dim 128 and 256 (two 128-dim sub-groups).
+            // Dynamically disable for any other architecture to prevent a C++ throw.
+            if fullK.dim(-1) != 128 && fullK.dim(-1) != 256 {
+                print("[TurboKV] Warning: Model head_dim (\(fullK.dim(-1))) unsupported. TurboKV supports 128 and 256. Compression disabled.")
                 turboQuantEnabled = false
             } else {
                 // Encode history past the eviction boundary into 3-bit PolarQuant primitives
