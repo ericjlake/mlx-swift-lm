@@ -88,15 +88,10 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
-    // EXPERIMENTAL_SSD_STREAM: Initialize the ExpertStreamerManager.
-    // The streamer handles on-demand SSD reads during inference.
-    // NOTE: We intentionally do NOT shed weights during loading — the model needs
-    // all expert weights properly loaded and quantized. The 60GB of expert weights
-    // ARE loaded via mmap (memory-mapped files), but they are NOT paged into RAM
-    // until accessed. macOS's lazy mmap means only the dense weights + active
-    // expert slabs are in physical RAM at any one time.
-    let streamEnv = getenv("EXPERIMENTAL_SSD_STREAM")
-    if let envPtr = streamEnv, String(cString: envPtr) != "" {
+    // ExpertStreamingConfig: Initialize the ExpertStreamerManager when streaming is active.
+    // On macOS: pread() from NVMe at ~5 GB/s.
+    // On iOS:   mmap page-cache from APFS at ~2-3 GB/s — same struct, different bandwidth.
+    if ExpertStreamingConfig.shared.isEnabled {
         ExpertStreamerManager.shared = ExpertStreamerManager(modelDirectory: modelDirectory)
     }
 
@@ -119,11 +114,30 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
 
-    if let envPtr = getenv("EXPERIMENTAL_SSD_STREAM"), String(cString: envPtr) != "" {
-        // Pass the tensorName to each QuantizedSwitchLinear layer dynamically
+    if ExpertStreamingConfig.shared.isEnabled {
+        // Assign tensorName to each QuantizedSwitchLinear.
+        //
+        // CRITICAL: tensorName must be the ORIGINAL key in the safetensors shard
+        // (before sanitize() strips VLM wrapper prefixes like "language_model."),
+        // because BOTH ExpertStreamerManager.getFile() and the C++ streamedGatherMM
+        // pread() use this key to locate the tensor bytes within the shard file.
+        //
+        // Example for Mistral4:
+        //   post-sanitize path → "model.layers.0.mlp.switch_mlp.gate_proj"
+        //   original shard key → "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        //
+        // We probe the ExpertStreamerManager weight map with common VLM prefixes
+        // and fall back to the bare path if none match.
+        let knownPrefixes = ["language_model.", "model.language_model.", ""]
         for (path, module) in model.leafModules().flattened() {
             if let qsl = module as? QuantizedSwitchLinear {
-                qsl.tensorName = "\(path).weight"
+                let bareName = "\(path).weight"
+                // Find the original key that exists in the shard index
+                let originalKey = knownPrefixes.lazy
+                    .map { $0 + bareName }
+                    .first { ExpertStreamerManager.shared?.getFile(for: $0) != nil }
+                    ?? bareName  // fallback: use bare name (works when model has no VLM wrapper)
+                qsl.tensorName = originalKey
             }
         }
     }

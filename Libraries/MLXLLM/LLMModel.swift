@@ -4,6 +4,19 @@ import MLX
 import MLXLMCommon
 import Tokenizers
 
+// MARK: - Prefill Progress Hook
+//
+// This global closure is set by Server.swift before each generate() call and
+// cleared when the first decode token arrives. It mirrors llama-server's
+// slot_update progress reporting: called after each 512-token prefill chunk
+// with (n_past, n_total).
+//
+// Thread model: written by the server async task before generation starts
+// (happens-before the generation Task reads it), and read only from the
+// synchronous MLX evaluation thread inside prepare(). This is safe without
+// a lock because writes precede all reads in time.
+public nonisolated(unsafe) var activePrefillProgressHook: ((Int, Int) -> Void)? = nil
+
 /// Marker protocol for LLMModels
 public protocol LLMModel: LanguageModel, LoRAModel {
 
@@ -23,14 +36,20 @@ extension LLMModel {
         -> PrepareResult
     {
         let prefillStepSize = windowSize ?? 512
+        let totalTokens = input.text.tokens.size
         var y = input.text
+        var processed = 0
 
-        // Prepare the prompt in chunks if larger than the prefill size
+        // Prepare the prompt in chunks if larger than the prefill size.
+        // After each chunk, call the progress hook so the server can emit
+        // llama-server-style slot_update SSE events with real n_past.
         while y.tokens.size > prefillStepSize {
             let input = y[.newAxis, ..<prefillStepSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
             y = y[prefillStepSize...]
+            processed += prefillStepSize
+            activePrefillProgressHook?(processed, totalTokens)
         }
 
         return .tokens(y)

@@ -107,7 +107,7 @@ public func partitionedLayerCall<T>(
 ) -> T {
     let result: T
     
-    let isSsdStream = getenv("EXPERIMENTAL_SSD_STREAM") != nil
+    let isSsdStream = ExpertStreamingConfig.shared.isEnabled
     
     if let gpuCount = gpuLayerCount, index >= gpuCount, !isSsdStream {
         // CPU layer — scope the computation to the CPU device

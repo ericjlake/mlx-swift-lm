@@ -64,7 +64,7 @@ public class SwitchGLU: Module {
 
         // We must force sorting/flattening when SSD streaming is active to properly batch
         // expert kernel dispatches dynamically over contiguous arrays.
-        let isSSDStreaming = ProcessInfo.processInfo.environment["EXPERIMENTAL_SSD_STREAM"] != nil
+        let isSSDStreaming = ExpertStreamingConfig.shared.isEnabled
         if isSSDStreaming { MLX.eval(indices) }
         let doSort = (indices.size >= 64) || isSSDStreaming
 
@@ -183,42 +183,47 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
-        if let envPath = ProcessInfo.processInfo.environment["EXPERIMENTAL_SSD_STREAM"] {
+        if ExpertStreamingConfig.shared.isEnabled {
             MLX.eval(indices)
             if indices.size == 0 {
                 var outShape = x.shape
                 outShape[outShape.count - 1] = self.outputDims
                 return MLXArray.zeros(outShape).asType(.float16)
             }
-            
+
             let cpuIndices = indices.asArray(UInt32.self)
             var expertResults = [MLXArray]()
             var startIdx = 0
-            
-            // Resolve safetensors path + tensor name once per forward pass
+
+            // macOS directNVMe: resolve the safetensors shard + tensor offset once.
+            // iOS mmapPageCache: ssdInfo = nil → falls through to mmap prefault below.
             let ssdInfo: (path: String, tensorName: String)? = {
-                guard let tName = self.tensorName,
-                      let filename = ExpertStreamerManager.shared?.getFile(for: tName) else { return nil }
-                let path = URL(fileURLWithPath: envPath).appendingPathComponent(filename).path
+                #if os(macOS)
+                guard ExpertStreamingConfig.shared.useDirectNVMe,
+                      let tName = self.tensorName,
+                      let filename = ExpertStreamerManager.shared?.getFile(for: tName),
+                      let dir = ExpertStreamingConfig.shared.modelDirectory else { return nil }
+                let path = dir.appendingPathComponent(filename).path
                 return (path, tName)
+                #else
+                return nil  // iOS always uses mmap fallback
+                #endif
             }()
-            
+
             while startIdx < cpuIndices.count {
                 let currentExpert = Int(cpuIndices[startIdx])
                 var endIdx = startIdx + 1
                 while endIdx < cpuIndices.count && Int(cpuIndices[endIdx]) == currentExpert {
                     endIdx += 1
                 }
-                
+
                 let rangeX = x[startIdx ..< endIdx]
                 let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
-                
+
                 let readStart = DispatchTime.now().uptimeNanoseconds
                 let expertWeight: MLXArray
                 if let info = ssdInfo {
-                    // Fast path: LoadSSDExpert allocates fresh allocator::malloc memory and
-                    // pread()s directly from NVMe into it — full 5 GB/s NVMe throughput.
-                    // The cache-keying bug (E → tensor_name) is now fixed so offsets are correct.
+                    // macOS directNVMe: pread() at ~5 GB/s, fresh malloc, freed after use.
                     expertWeight = MLXFast.streamedGatherMM(
                         x: rangeX,
                         wShape: self.weight,
@@ -227,7 +232,9 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                         tensorName: info.tensorName
                     )
                 } else {
-                    // Slow fallback: use mmap-backed slice + prefault when no SSD mapping available
+                    // iOS mmap / macOS mmapPageCache: page-cache backed slice.
+                    // prefault() hints the OS to bring pages in before Metal needs them,
+                    // trading a brief CPU stall for zero Metal pipeline stall.
                     let w = self.weight[currentExpert ..< currentExpert + 1]
                     MLX.eval(w)
                     MLXFast.prefault(w)

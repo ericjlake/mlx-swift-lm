@@ -74,7 +74,27 @@ public enum LLMTypeRegistry {
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
-        "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
+        // "mistral3" is the outer model_type for two distinct text architectures:
+        //   • text_config.model_type == "ministral3"  →  dense 8B (Mistral3TextModel)
+        //   • text_config.model_type == "mistral4"    →  119B MoE + MLA (Mistral4Model)
+        "mistral3": { data in
+            struct InnerType: Decodable {
+                struct TextConfig: Decodable {
+                    let modelType: String?
+                    enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+                }
+                let textConfig: TextConfig?
+                enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
+            }
+            let probe = try JSONDecoder().decode(InnerType.self, from: data)
+            if probe.textConfig?.modelType == "mistral4" {
+                let config = try JSONDecoder.json5().decode(Mistral4Configuration.self, from: data)
+                return Mistral4Model(config)
+            } else {
+                let config = try JSONDecoder.json5().decode(Mistral3TextConfiguration.self, from: data)
+                return Mistral3TextModel(config)
+            }
+        },
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
     ])
 }
