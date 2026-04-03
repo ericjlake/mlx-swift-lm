@@ -141,7 +141,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
 
         // Gemma
-        if type == "gemma" {
+        if type.hasPrefix("gemma") {
             return .gemma
         }
 
