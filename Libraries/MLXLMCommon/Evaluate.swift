@@ -26,7 +26,7 @@ public protocol LogitSampler {
 ///
 /// ```swift
 /// logits = processor?.process(logits: logits) ?? logits
-/// let y = sampler.sample(logits: logits)
+/// let y = sampler.sample(logits: logits); print("GENERATED TOKEN INNER: ", y.item(Int.self))
 /// processor?.didSample(token: y)
 /// ```
 ///

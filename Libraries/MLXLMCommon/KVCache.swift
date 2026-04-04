@@ -316,6 +316,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     //   all tokens → polarKeys/polarValues packed buffers from token 1.
     //   AttentionUtils decodes the full packed buffer before each SDPA call.
     public var turboQuantEnabled: Bool = false
+    /// Tracks head_dim values that have already emitted a TurboKV fallback warning (log once per dim).
+    private static var turboWarnedHeadDims: Set<Int> = []
     public var polarKeys: MLXArray?    // packed uint8 [B, nKVH, T_total, 68 or 136]
     public var polarValues: MLXArray?  // packed uint8 [B, nKVH, T_total, 50 or 100]
     public var residualKeys: MLXArray?
@@ -381,8 +383,13 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         //   • Prompt-cache restore: restored fp16 stays in self.keys → not silently lost ✅
         //   • AttentionUtils: cachedKeys (hot window) and polarKeys (history) are disjoint ✅
         if turboQuantEnabled {
-            if keys.dim(-1) % 32 != 0 || keys.dim(-1) > 1024 || keys.dim(-1) == 0 {
-                print("[TurboKV] ⚠️  head_dim \(keys.dim(-1)) unsupported (needs multiples of 32 up to 1024). Falling back to fp16.")
+            let headDim = keys.dim(-1)
+            if headDim != 128 && headDim != 256 {
+                // Warn once per unique head_dim to avoid log spam (6 global layers × every prefill)
+                if !Self.turboWarnedHeadDims.contains(headDim) {
+                    Self.turboWarnedHeadDims.insert(headDim)
+                    print("[TurboKV] ⚠️  head_dim \(headDim) unsupported (turbo_encode_k requires 128 or 256). Falling back to fp16.")
+                }
                 turboQuantEnabled = false
             } else if self.offset > turboMinActivationTokens {
                 // Only compress once we have a genuinely long context.
