@@ -317,7 +317,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
 }
 
 public class ExpertStreamerManager {
-    public static var shared: ExpertStreamerManager?
+    nonisolated(unsafe) public static var shared: ExpertStreamerManager?
 
     public let weightMap: [String: String]
 

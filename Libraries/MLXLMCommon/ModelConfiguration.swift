@@ -144,7 +144,8 @@ public struct ModelConfiguration: Sendable {
             defaultPrompt: defaultPrompt,
             extraEOSTokens: extraEOSTokens,
             eosTokenIds: eosTokenIds,
-            toolCallFormat: toolCallFormat)
+            toolCallFormat: toolCallFormat,
+            lazyLoad: lazyLoad)
     }
 
 }

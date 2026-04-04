@@ -324,7 +324,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     //   AttentionUtils decodes the full packed buffer before each SDPA call.
     public var turboQuantEnabled: Bool = false
     /// Tracks head_dim values that have already emitted a TurboKV fallback warning (log once per dim).
-    private static var turboWarnedHeadDims: Set<Int> = []
+    nonisolated(unsafe) private static var turboWarnedHeadDims: Set<Int> = []
     /// When true, 512-dim heads were split into 2×256 virtual heads for TurboKV encoding.
     /// Decode must merge them back: [B, nKVH*2, T, 256] → [B, nKVH, T, 512]
     public var turboSplitHeads: Bool = false
