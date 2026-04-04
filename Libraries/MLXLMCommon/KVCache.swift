@@ -316,6 +316,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     //   all tokens → polarKeys/polarValues packed buffers from token 1.
     //   AttentionUtils decodes the full packed buffer before each SDPA call.
     public var turboQuantEnabled: Bool = false
+    /// Tracks head_dim values that have already emitted a TurboKV fallback warning (log once per dim).
+    private static var turboWarnedHeadDims: Set<Int> = []
+    /// When true, 512-dim heads were split into 2×256 virtual heads for TurboKV encoding.
+    /// Decode must merge them back: [B, nKVH*2, T, 256] → [B, nKVH, T, 512]
+    public var turboSplitHeads: Bool = false
     public var polarKeys: MLXArray?    // packed uint8 [B, nKVH, T_total, 68 or 136]
     public var polarValues: MLXArray?  // packed uint8 [B, nKVH, T_total, 50 or 100]
     public var residualKeys: MLXArray?
@@ -381,8 +386,14 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         //   • Prompt-cache restore: restored fp16 stays in self.keys → not silently lost ✅
         //   • AttentionUtils: cachedKeys (hot window) and polarKeys (history) are disjoint ✅
         if turboQuantEnabled {
-            if keys.dim(-1) % 32 != 0 || keys.dim(-1) > 1024 || keys.dim(-1) == 0 {
-                print("[TurboKV] ⚠️  head_dim \(keys.dim(-1)) unsupported (needs multiples of 32 up to 1024). Falling back to fp16.")
+            let headDim = keys.dim(-1)
+            let supportedDim = (headDim == 128 || headDim == 256)
+            let splittableDim = (headDim == 512) // split into 2×256 virtual heads
+            if !supportedDim && !splittableDim {
+                if !Self.turboWarnedHeadDims.contains(headDim) {
+                    Self.turboWarnedHeadDims.insert(headDim)
+                    print("[TurboKV] ⚠️  head_dim \(headDim) unsupported (turbo_encode_k requires 128 or 256). Falling back to fp16.")
+                }
                 turboQuantEnabled = false
             } else if self.offset > turboMinActivationTokens {
                 // Only compress once we have a genuinely long context.
@@ -392,8 +403,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
                 if newColdCount >= step {  // evict in step-sized chunks to avoid micro-operations
                     if let fullK = self.keys, let fullV = self.values {
-                        let coldK = fullK[.ellipsis, self.compressedOffset..<coldEnd, 0...]
-                        let coldV = fullV[.ellipsis, self.compressedOffset..<coldEnd, 0...]
+                        var coldK = fullK[.ellipsis, self.compressedOffset..<coldEnd, 0...]
+                        var coldV = fullV[.ellipsis, self.compressedOffset..<coldEnd, 0...]
+
+                        // Split 512-dim heads into 2×256 virtual heads for TurboKV encoding
+                        if headDim == 512 {
+                            turboSplitHeads = true
+                            let B = coldK.dim(0), H = coldK.dim(1), T = coldK.dim(2)
+                            coldK = coldK.reshaped(B, H * 2, T, 256)
+                            coldV = coldV.reshaped(B, H * 2, T, 256)
+                        }
 
                         let (qK, qV) = MLXFast.turboQuantEncode(keys: coldK, values: coldV, bits: 3)
 
@@ -421,7 +440,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
                         TurboKVCacheTelemetry.logOnce(
                             compressedOffset: newColdCount, keys: qK.0, values: qV.0,
-                            headDim: keys.dim(-1))
+                            headDim: turboSplitHeads ? 256 : keys.dim(-1))
                     }
                 }
             }
@@ -457,8 +476,14 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                let pk = polarKeys, let pv = polarValues,
                compressedOffset > 0,
                let hotK = self.keys, let hotV = self.values {
-                let histK = MLXFast.turboDecodeK(packed: pk)
-                let histV = MLXFast.turboDecodeV(packed: pv)
+                var histK = MLXFast.turboDecodeK(packed: pk)
+                var histV = MLXFast.turboDecodeV(packed: pv)
+                // Merge 2×256 virtual heads back to original head count × 512
+                if turboSplitHeads {
+                    let B = histK.dim(0), H2 = histK.dim(1), T = histK.dim(2)
+                    histK = histK.reshaped(B, H2 / 2, T, 512)
+                    histV = histV.reshaped(B, H2 / 2, T, 512)
+                }
                 let hotKSlice = hotK[.ellipsis, ..<offset, 0...]
                 let hotVSlice = hotV[.ellipsis, ..<offset, 0...]
                 return [
@@ -487,6 +512,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             self.compressedOffset = 0
             self.residualKeys = nil
             self.residualValues = nil
+            self.turboSplitHeads = false
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
@@ -741,7 +767,19 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
+        
         idx -= trimmed
+        // Wrap circular buffer correctly, skipping 'keep' region
+        while idx < keep && offset >= keep {
+            // idx underflowed into the keep region (or negative). 
+            // The logical step back from 'keep' is the end of the buffer.
+            idx += (maxCacheSize - keep)
+        }
+        if offset < keep {
+            // If offset itself is within the keep region, idx and offset match.
+            idx = offset
+        }
+
         return trimmed
     }
 
@@ -750,14 +788,25 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         if n > 1 {
-            // Multi-token case
+            // Multi-token case (prefill / prompt re-encode)
+            //
+            // updateConcat temporarily allows the physical key buffer to grow to
+            // (existingKeys + n) before trimming back toward maxCacheSize + n - 1.
+            // The buffer returned to the attention layer has exactly:
+            //   physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
+            // columns, where existingKeys = min(offset, maxCacheSize).
+            //
+            // The mask must be [n, physicalKeyCount] wide, so we pass
+            //   offset = physicalKeyCount - n  to createCausalMask.
             let actualWindowSize = windowSize ?? maxCacheSize
-            let cappedOffset = min(maxCacheSize - 1, offset)
+            let existingKeys = min(offset, maxCacheSize)
+            // Physical key width the cache returns for this n-token batch
+            let physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
+            let maskOffset = physicalKeyCount - n
 
-            // Decide if we need an array mask
-            if cappedOffset + n > actualWindowSize || returnArray {
+            if maskOffset + n > actualWindowSize || returnArray {
                 return .array(
-                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+                    createCausalMask(n: n, offset: maskOffset, windowSize: actualWindowSize))
             }
             return .causal
         } else {
