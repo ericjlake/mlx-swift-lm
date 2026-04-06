@@ -462,8 +462,8 @@ class Gemma4Router: Module {
         self.eps = eps
         self.scalarRootSize = 1.0 / sqrt(Float(dimensions))
         self._proj.wrappedValue = Linear(dimensions, numExperts, bias: false)
-        self._scale.wrappedValue = MLXArray.zeros([dimensions])
-        self._perExpertScale.wrappedValue = MLXArray.zeros([numExperts])
+        self._scale.wrappedValue = MLXArray.ones([dimensions])
+        self._perExpertScale.wrappedValue = MLXArray.ones([numExperts])
         super.init()
     }
 
@@ -662,7 +662,10 @@ class Gemma4TransformerBlock: Module {
     }
 }
 
-public class Gemma4ModelInternal: Module {
+// Restored LayerPartitionable & StreamableMoE conformance to re-enable 
+// SSD expert streaming, bridging the missing protocols from Damon Janis's initial draft.
+// Reference: https://github.com/SharpAI/mlx-swift-lm/pull/1
+public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo var layers: [Gemma4TransformerBlock]
     @ModuleInfo var norm: RMSNorm
@@ -673,6 +676,13 @@ public class Gemma4ModelInternal: Module {
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
     let config: Gemma4Configuration
+
+    // LayerPartitionable
+    public var gpuLayerCount: Int? = nil
+    public var totalLayerCount: Int { layers.count }
+    
+    // StreamableMoE
+    public var streamExperts: Bool = false
 
     init(_ config: Gemma4Configuration) {
         self.config = config
@@ -759,7 +769,10 @@ public class Gemma4ModelInternal: Module {
             let layerMask = isGlobal ? globalMask : slidingWindowMask
             // Slice per-layer conditioning for this layer: [B, L, D]
             let pli = perLayerInputs.map { $0[0..., 0..., i, 0...] }
-            h = layer(h, mask: layerMask, cache: layerCache?[i], perLayerInput: pli)
+            
+            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts, cacheToEval: layerCache?[i]) {
+                layer(h, mask: layerMask, cache: layerCache?[i], perLayerInput: pli)
+            }
         }
         return norm(h)
     }
@@ -845,82 +858,19 @@ public class Gemma4Model: Module, LLMModel {
         }
 
         // Handle mixed-quantization: MLP and MoE experts might be 8-bit while other layers are 4-bit.
-        // 3. Setup dynamic layer updates
-        var moduleUpdates: [(String, Module)] = []
-        
-        // Dynamically wrap embed_tokens with QuantizedEmbedding if its shape count indicates packed uint32 (shape is 2, normally shape is 2 anyway but we check for matching scale). Since we know it's a 4-bit A4B model, we just check if scales exist.
-        if let embedScales = processedWeights["model.embed_tokens.scales"], let embedTokens = model.embedTokens as? Embedding {
-            moduleUpdates.append(("model.embed_tokens", QuantizedEmbedding(embedTokens, groupSize: 64, bits: 4)))
-        }
-
-        // 4. Update the MoE and MLP parameter overrides inside the layers loop.
-        for (i, layer) in self.model.layers.enumerated() {
-            // Check MLP
-            let mlp = layer.mlp
-            if let gate = mlp.gateProj as? Linear, let down = mlp.downProj as? Linear, let up = mlp.upProj as? Linear {
-                if let w = finalWeights["language_model.model.layers.\(i).mlp.gate_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.gate_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / gate.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.gate_proj", QuantizedLinear(gate, groupSize: 64, bits: bits)))
-                }
-                if let w = finalWeights["language_model.model.layers.\(i).mlp.down_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.down_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / down.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.down_proj", QuantizedLinear(down, groupSize: 64, bits: bits)))
-                }
-                if let w = finalWeights["language_model.model.layers.\(i).mlp.up_proj.weight"] ?? finalWeights["model.layers.\(i).mlp.up_proj.weight"], w.shape.count == 2 {
-                    let bits = 32 * w.shape.last! / up.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).mlp.up_proj", QuantizedLinear(up, groupSize: 64, bits: bits)))
-                }
+        for i in 0..<config.hiddenLayers {
+            let wKey = "model.layers.\(i).experts.router.proj.weight"
+            let sKey = "model.layers.\(i).experts.router.proj.scales"
+            let bKey = "model.layers.\(i).experts.router.proj.biases"
+            if let packedW = finalWeights[wKey],
+               let scales = finalWeights[sKey],
+               let biases = finalWeights[bKey] {
+                let bits = 32 * packedW.shape.last! / (scales.shape.last! * 64)
+                finalWeights[wKey] = MLX.dequantized(
+                    packedW, scales: scales, biases: biases, groupSize: 64, bits: bits)
+                finalWeights.removeValue(forKey: sKey)
+                finalWeights.removeValue(forKey: bKey)
             }
-
-            // Check Experts switchGLU
-            let switchGLU = layer.expertsBlock.switchGLU
-            if let gate = switchGLU.gateProj as? SwitchLinear, let down = switchGLU.downProj as? SwitchLinear, let up = switchGLU.upProj as? SwitchLinear {
-                if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.gate_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.gate_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / gate.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.gate_proj", QuantizedSwitchLinear(gate, groupSize: 64, bits: bits)))
-                }
-                if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.down_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.down_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / down.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.down_proj", QuantizedSwitchLinear(down, groupSize: 64, bits: bits)))
-                }
-                if let w = finalWeights["language_model.model.layers.\(i).experts.switch_glu.up_proj.weight"] ?? finalWeights["model.layers.\(i).experts.switch_glu.up_proj.weight"], w.shape.count == 3 {
-                    let bits = 32 * w.shape.last! / up.weight.shape.last!
-                    moduleUpdates.append(("model.layers.\(i).experts.switch_glu.up_proj", QuantizedSwitchLinear(up, groupSize: 64, bits: bits)))
-                }
-            }
-
-            // Check Router
-            // Let the built-in loader wrap the Linear layer correctly. No router override needed.
-            
-            // Check Attention Projections (q, k, v, o)
-            if let qW = finalWeights["language_model.model.layers.\(i).self_attn.q_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.q_proj.weight"], qW.shape.count == 2 {
-                if let qProj = layer.selfAttention.queryProj as? Linear {
-                    let bits = 32 * qW.shape.last! / qProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.q_proj", QuantizedLinear(qProj, groupSize: 64, bits: bits)))
-                }
-            }
-            if let kW = finalWeights["language_model.model.layers.\(i).self_attn.k_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.k_proj.weight"], kW.shape.count == 2 {
-                if let kProj = layer.selfAttention.keyProj as? Linear {
-                    let bits = 32 * kW.shape.last! / kProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.k_proj", QuantizedLinear(kProj, groupSize: 64, bits: bits)))
-                }
-            }
-            if let vW = finalWeights["language_model.model.layers.\(i).self_attn.v_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.v_proj.weight"], vW.shape.count == 2 {
-                if let vProj = layer.selfAttention.valueProj as? Linear {
-                    let bits = 32 * vW.shape.last! / vProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.v_proj", QuantizedLinear(vProj, groupSize: 64, bits: bits)))
-                }
-            }
-            if let oW = finalWeights["language_model.model.layers.\(i).self_attn.o_proj.weight"] ?? finalWeights["model.layers.\(i).self_attn.o_proj.weight"], oW.shape.count == 2 {
-                if let oProj = layer.selfAttention.outputProj as? Linear {
-                    let bits = 32 * oW.shape.last! / oProj.weight.shape[1]
-                    moduleUpdates.append(("model.layers.\(i).self_attn.o_proj", QuantizedLinear(oProj, groupSize: 64, bits: bits)))
-                }
-            }
-        }
-        
-        if !moduleUpdates.isEmpty {
-            self.update(modules: ModuleChildren.unflattened(moduleUpdates))
         }
 
         // Per-layer conditioning weights are now fully implemented and loaded normally.

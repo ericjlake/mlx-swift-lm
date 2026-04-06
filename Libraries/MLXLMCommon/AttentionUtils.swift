@@ -115,18 +115,36 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
+
     if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         if isCPU {
             fatalError("[metal_kernel] Quantized KV Cache partitioning is only supported on GPU.")
         }
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
+            
+        let targetS = quantizedKeys.0.dim(2)
+        var safeMask = mask
+        if case .array(let customMask) = mask {
+            if customMask.dim(-1) != targetS && customMask.dim(-1) > targetS {
+                let sliced: MLXArray
+                if customMask.ndim == 2 {
+                    sliced = customMask[0..., ..<targetS]
+                } else if customMask.ndim == 4 {
+                    sliced = customMask[0..., 0..., 0..., ..<targetS]
+                } else {
+                    fatalError("Unsupported mask dimensionality: \(customMask.ndim)")
+                }
+                safeMask = .array(sliced)
+            }
+        }
+        
         return quantizedScaledDotProductAttention(
             queries: queries,
             quantizedKeys: quantizedKeys,
             quantizedValues: quantizedValues,
             scale: scale,
-            mask: mask,
+            mask: safeMask,
             groupSize: quantizedKVCache.groupSize,
             bits: quantizedKVCache.bits,
             mode: quantizedKVCache.mode
@@ -160,19 +178,32 @@ public func attentionWithCacheUpdate(
             // Telemetry fed from KVCache.update() on the compression path.
         }
 
-
-
-
+        let targetS = fullKeys.dim(2)
+        var safeMask = mask
+        if case .array(let customMask) = mask {
+            if customMask.dim(-1) != targetS && customMask.dim(-1) > targetS {
+                let sliced: MLXArray
+                if customMask.ndim == 2 {
+                    sliced = customMask[0..., ..<targetS]
+                } else if customMask.ndim == 4 {
+                    sliced = customMask[0..., 0..., 0..., ..<targetS]
+                } else {
+                    fatalError("Unsupported mask dimensionality: \(customMask.ndim)")
+                }
+                safeMask = .array(sliced)
+            }
+        }
+        
         if isCPU {
             return fallbackScaledDotProductAttention(
-                queries: queries, keys: fullKeys, values: fullValues, scale: scale, mask: mask)
+                queries: queries, keys: fullKeys, values: fullValues, scale: scale, mask: safeMask)
         }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: fullKeys,
             values: fullValues,
             scale: scale,
-            mask: mask
+            mask: safeMask
         )
     }
 }
