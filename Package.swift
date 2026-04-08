@@ -36,7 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/SharpAI/mlx-swift.git", branch: "main"),
+        .package(path: "../mlx-swift"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.2.0")
