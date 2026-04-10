@@ -150,6 +150,142 @@ public class SwitchLinear: Module, Quantizable {
     }
 }
 
+// MARK: - Hot Expert Weight Cache
+
+/// Thread-safe LRU cache for recently-loaded expert weight matrices.
+///
+/// MoE routing shows strong temporal locality — adjacent tokens frequently
+/// route to the same experts (60-70% overlap in practice). By caching the
+/// quantized weight MLXArray in unified memory, we eliminate redundant
+/// pread() syscalls and MLX allocator round-trips on cache hits.
+///
+/// The cache key is (safetensorsPath, tensorName, expertIndex). Entries are
+/// evicted in LRU order when the cache exceeds `maxEntries`.
+public final class ExpertWeightCache: @unchecked Sendable {
+    public static let shared = ExpertWeightCache()
+
+    /// Maximum number of cached expert weight matrices.
+    /// Each entry is typically ~200KB-2MB for 4-bit quantized experts.
+    /// Default 8192 entries ≈ 1.6-16 GB depending on expert size.
+    public var maxEntries: Int = 8192
+
+    private struct CacheEntry {
+        let weight: MLXArray
+        var lastAccess: UInt64
+    }
+
+    private var cache = [String: CacheEntry]()
+    private var accessOrder = [String]()  // oldest-first for LRU eviction
+    private let lock = NSLock()
+
+    // Metrics
+    private var hits: UInt64 = 0
+    private var misses: UInt64 = 0
+    private var lastLogTime: UInt64 = 0
+
+    private init() {
+        lastLogTime = DispatchTime.now().uptimeNanoseconds
+    }
+
+    /// Build a unique cache key for an expert weight matrix.
+    public static func key(path: String, tensorName: String, expertIndex: UInt32) -> String {
+        "\(path)|\(tensorName)|\(expertIndex)"
+    }
+
+    /// Look up a cached expert weight. Returns nil on miss.
+    public func get(_ key: String) -> MLXArray? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard var entry = cache[key] else {
+            misses += 1
+            logIfNeeded()
+            return nil
+        }
+
+        hits += 1
+        entry.lastAccess = DispatchTime.now().uptimeNanoseconds
+        cache[key] = entry
+
+        // Move to end of access order (most recent)
+        if let idx = accessOrder.firstIndex(of: key) {
+            accessOrder.remove(at: idx)
+        }
+        accessOrder.append(key)
+
+        logIfNeeded()
+        return entry.weight
+    }
+
+    /// Insert an expert weight into the cache. Evicts LRU entries if over capacity.
+    public func put(_ key: String, weight: MLXArray) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if cache[key] != nil {
+            // Already cached (race between concurrent callers) — just update access
+            if let idx = accessOrder.firstIndex(of: key) {
+                accessOrder.remove(at: idx)
+            }
+            accessOrder.append(key)
+            return
+        }
+
+        // Evict LRU entries if over capacity
+        while cache.count >= maxEntries, !accessOrder.isEmpty {
+            let evictKey = accessOrder.removeFirst()
+            cache.removeValue(forKey: evictKey)
+        }
+
+        cache[key] = CacheEntry(
+            weight: weight,
+            lastAccess: DispatchTime.now().uptimeNanoseconds
+        )
+        accessOrder.append(key)
+    }
+
+    /// Clear the entire cache (e.g. on model unload).
+    public func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache.removeAll()
+        accessOrder.removeAll()
+        hits = 0
+        misses = 0
+    }
+
+    /// Current number of cached entries.
+    public var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache.count
+    }
+
+    // Log hit rate every 10 seconds (lock must be held)
+    private func logIfNeeded() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now - lastLogTime >= 10_000_000_000 { // 10 seconds
+            let total = hits + misses
+            if total > 0 {
+                let hitRate = Double(hits) / Double(total) * 100.0
+                let h = hits
+                let m = misses
+                let c = cache.count
+                // Reset window counters
+                hits = 0
+                misses = 0
+                lastLogTime = now
+                // Print outside lock would be ideal, but we're in a defer.
+                // stderr to avoid interleaving with token stream.
+                fputs(String(format: "[🧠 Expert Cache] %.1f%% hit rate | %llu hits, %llu misses | %d entries cached\n", hitRate, h, m, c), stderr)
+                fflush(stderr)
+            } else {
+                lastLogTime = now
+            }
+        }
+    }
+}
+
 public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     @ModuleInfo(key: "scales") var scales: MLXArray
     @ModuleInfo(key: "biases") var biases: MLXArray?
@@ -208,6 +344,32 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 return nil  // iOS always uses mmap fallback
                 #endif
             }()
+            let disableCache = ProcessInfo.processInfo.environment["DISABLE_EXPERT_CACHE"] == "1"
+
+            if let info = ssdInfo {
+                var uniqueExperts = Set<Int>()
+                var prefetchIdx = 0
+                while prefetchIdx < cpuIndices.count {
+                    uniqueExperts.insert(Int(cpuIndices[prefetchIdx]))
+                    prefetchIdx += 1
+                }
+
+                for expert in uniqueExperts {
+                    let cacheKey = ExpertWeightCache.key(
+                        path: info.path,
+                        tensorName: info.tensorName,
+                        expertIndex: UInt32(expert)
+                    )
+                    
+                    if disableCache || ExpertWeightCache.shared.get(cacheKey) == nil {
+                        MLXFast.pappsPrefetch(
+                            safetensorsPath: info.path,
+                            tensorName: info.tensorName,
+                            expertIndex: UInt32(expert)
+                        )
+                    }
+                }
+            }
 
             while startIdx < cpuIndices.count {
                 let currentExpert = Int(cpuIndices[startIdx])
@@ -222,16 +384,32 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 let readStart = DispatchTime.now().uptimeNanoseconds
                 let expertWeight: MLXArray
                 if let info = ssdInfo {
-                    // macOS PAPPS directNVMe: synchronous NVMe queue bypass with background caching.
-                    let w = MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype)
-                    MLX.eval(w)
-                    MLXFast.preadInto(
-                        w,
-                        safetensorsPath: info.path,
+                    // ── Hot Expert Cache: check LRU before hitting SSD ──
+                    let cacheKey = ExpertWeightCache.key(
+                        path: info.path,
                         tensorName: info.tensorName,
                         expertIndex: UInt32(currentExpert)
                     )
-                    expertWeight = w
+                    
+                    if !disableCache, let cached = ExpertWeightCache.shared.get(cacheKey) {
+                        // Cache HIT — zero I/O, direct pointer reuse
+                        expertWeight = cached
+                    } else {
+                        // Cache MISS (or disabled) — synchronous NVMe pread()
+                        let w = MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype)
+                        MLX.eval(w)
+                        MLXFast.preadInto(
+                            w,
+                            safetensorsPath: info.path,
+                            tensorName: info.tensorName,
+                            expertIndex: UInt32(currentExpert)
+                        )
+                        expertWeight = w
+                        // Insert into cache for future tokens
+                        if !disableCache {
+                            ExpertWeightCache.shared.put(cacheKey, weight: w)
+                        }
+                    }
                 } else {
                     // iOS mmap / macOS mmapPageCache: page-cache backed slice.
                     let w = self.weight[currentExpert ..< currentExpert + 1]
@@ -291,17 +469,9 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 return MLXArray.zeros(outShape).asType(.float16)
             }
 
-            // PAPPS Heuristic: Prefetch exactly these experts so they are in cache for the N+1 token.
-            if let info = ssdInfo {
-                let uniqueIndices = Set(cpuIndices)
-                for _ in uniqueIndices {
-                    // MLXFast.pappsPrefetch(
-                    //     safetensorsPath: info.path,
-                    //     tensorName: info.tensorName,
-                    //     expertIndex: idx
-                    // )
-                }
-            }
+            // Hot Expert Cache: current token's experts are already cached
+            // by the read loop above. No prefetch needed — the LRU cache
+            // naturally retains them for reuse by subsequent tokens.
 
             return MLX.concatenated(expertResults, axis: 0)
         }
