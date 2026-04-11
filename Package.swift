@@ -60,6 +60,7 @@ let package = Package(
         .target(
             name: "MLXVLM",
             dependencies: [
+                "MLXLLM",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
