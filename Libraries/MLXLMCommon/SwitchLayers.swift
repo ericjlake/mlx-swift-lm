@@ -25,6 +25,14 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+
+// Shared struct for expert range tracking across projections
+public struct ExpertRange {
+    public let id: Int
+    public let start: Int
+    public let end: Int
+}
+
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
@@ -64,7 +72,8 @@ public class SwitchGLU: Module {
         // We must force sorting/flattening when SSD streaming is active to properly batch
         // expert kernel dispatches dynamically over contiguous arrays.
         let isSSDStreaming = ExpertStreamingConfig.shared.isEnabled
-        if isSSDStreaming { MLX.eval(indices) }
+        // NOTE: indices eval deferred to inside the cross-projection path below,
+        // where it's merged with buffer allocation into fewer eval calls.
         let doSort = (indices.size >= 64) || isSSDStreaming
 
         var idx = indices
@@ -74,6 +83,173 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
+        // ── Cross-projection batched SSD streaming path ──────────────────
+        // When all 3 projections are quantized and SSD-streaming is active,
+        // orchestrate buffer allocation, pread, and compute across all 3
+        // projections to minimize MLX.eval() calls:
+        //   - Single-token (fast path): 1 eval merges idx + buffer alloc
+        //   - Prompt (large batch): 2 evals (idx, then buffers)
+        //   - NO final eval — next layer's eval(idx) forces this layer
+        // This reduces from 4 evals/layer (original) to 1 eval/layer.
+        if isSSDStreaming,
+           let qGate = gateProj as? QuantizedSwitchLinear,
+           let qUp = upProj as? QuantizedSwitchLinear,
+           let qDown = downProj as? QuantizedSwitchLinear,
+           let gateSSD = qGate.resolveSSDInfo(),
+           let upSSD = qUp.resolveSSDInfo(),
+           let downSSD = qDown.resolveSSDInfo() {
+
+            // ── EVAL REDUCTION STRATEGY ──────────────────────────────────────
+            // For single-token generation (idx.size ≤ 32), we merge the sorted-
+            // indices eval and buffer-allocation eval into ONE call, cutting from
+            // 3 evals/layer to 1.  The final MLX.eval(x) is removed entirely:
+            // the NEXT layer's SwitchGLU eval(idx) transitively forces this
+            // layer's full output (including KV cache) through the lazy
+            // dependency chain.  For the last layer, the generation loop's eval
+            // of logits handles it.
+            // ─────────────────────────────────────────────────────────────────
+
+            if idx.size <= 32 {
+                // ── FAST PATH: single-token generation ──
+                // Pre-allocate max buffers (idx.size = top_k, e.g. 8) and eval
+                // everything in a single call.
+                let maxBuffers = idx.size
+                let gateBuffers = qGate.allocateExpertBuffers(maxBuffers)
+                let upBuffers = qUp.allocateExpertBuffers(maxBuffers)
+                let downBuffers = qDown.allocateExpertBuffers(maxBuffers)
+
+                // SINGLE EVAL: sorted indices + all buffer allocations.
+                // Evaluating idx also transitively forces the PREVIOUS layer's
+                // complete output (including KV cache) since idx depends on
+                // router(prev_layer_output) via gatherSort.
+                var toEval: [MLXArray] = [idx]
+                toEval.append(contentsOf: gateBuffers)
+                toEval.append(contentsOf: upBuffers)
+                toEval.append(contentsOf: downBuffers)
+                MLX.eval(toEval)
+
+                // Handle empty indices
+                if idx.size == 0 {
+                    var outShape = x.shape
+                    outShape[outShape.count - 1] = qDown.outputDims
+                    let result = MLXArray.zeros(outShape).asType(.float16)
+                    if doSort {
+                        return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
+                    }
+                    return MLX.squeezed(result, axis: -2)
+                }
+
+                // Parse expert ranges from materialized sorted indices
+                let cpuIndices = idx.asArray(UInt32.self)
+                var ranges = [ExpertRange]()
+                var startIdx = 0
+                while startIdx < cpuIndices.count {
+                    let eid = Int(cpuIndices[startIdx])
+                    var endIdx = startIdx + 1
+                    while endIdx < cpuIndices.count && Int(cpuIndices[endIdx]) == eid { endIdx += 1 }
+                    ranges.append(ExpertRange(id: eid, start: startIdx, end: endIdx))
+                    startIdx = endIdx
+                }
+
+                // ── CONCURRENT PREAD: all 3 projections × all experts in parallel ──
+                // Dispatches up to 24 pread() syscalls simultaneously (8 experts × 3 projections),
+                // pushing NVMe queue depth from QD=1 to QD=~24.
+                // Raw benchmark: QD=1 = 4.5 GB/s, QD=8 = 12.3 GB/s → ~2.7× throughput.
+                // preadInto is thread-safe: unique buffer per call, pread() uses explicit offset.
+                let usedGate = Array(gateBuffers[0..<ranges.count])
+                let usedUp = Array(upBuffers[0..<ranges.count])
+                let usedDown = Array(downBuffers[0..<ranges.count])
+                let totalReads = ranges.count * 3
+                DispatchQueue.concurrentPerform(iterations: totalReads) { i in
+                    let expertIdx = i / 3
+                    let projIdx = i % 3
+                    let r = ranges[expertIdx]
+                    switch projIdx {
+                    case 0:
+                        MLXFast.preadInto(usedGate[expertIdx], safetensorsPath: gateSSD.path,
+                                          tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                    case 1:
+                        MLXFast.preadInto(usedUp[expertIdx], safetensorsPath: upSSD.path,
+                                          tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                    default:
+                        MLXFast.preadInto(usedDown[expertIdx], safetensorsPath: downSSD.path,
+                                          tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                    }
+                }
+
+                // Lazy compute (no eval — next layer forces it)
+                let xGate = qGate.computeExperts(x, buffers: Array(gateBuffers[0..<ranges.count]), ranges: ranges)
+                let xUp = qUp.computeExperts(x, buffers: Array(upBuffers[0..<ranges.count]), ranges: ranges)
+                let intermediate = activation(xGate) * xUp
+                x = qDown.computeExperts(intermediate, buffers: Array(downBuffers[0..<ranges.count]), ranges: ranges)
+
+            } else {
+                // ── PROMPT PATH: larger batches ──
+                // Eval indices first (needed for range count), then allocate exact buffers.
+                MLX.eval(idx)
+
+                // Handle empty indices
+                if idx.size == 0 {
+                    var outShape = x.shape
+                    outShape[outShape.count - 1] = qDown.outputDims
+                    let result = MLXArray.zeros(outShape).asType(.float16)
+                    if doSort {
+                        return MLX.squeezed(scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape), axis: -2)
+                    }
+                    return MLX.squeezed(result, axis: -2)
+                }
+
+                // Parse expert ranges
+                let cpuIndices = idx.asArray(UInt32.self)
+                var ranges = [ExpertRange]()
+                var startIdx = 0
+                while startIdx < cpuIndices.count {
+                    let eid = Int(cpuIndices[startIdx])
+                    var endIdx = startIdx + 1
+                    while endIdx < cpuIndices.count && Int(cpuIndices[endIdx]) == eid { endIdx += 1 }
+                    ranges.append(ExpertRange(id: eid, start: startIdx, end: endIdx))
+                    startIdx = endIdx
+                }
+
+                // Allocate exact buffer count and eval
+                let gateBuffers = qGate.allocateExpertBuffers(ranges.count)
+                let upBuffers = qUp.allocateExpertBuffers(ranges.count)
+                let downBuffers = qDown.allocateExpertBuffers(ranges.count)
+                MLX.eval(gateBuffers + upBuffers + downBuffers)
+
+                // Concurrent pread (same as fast path)
+                let totalReads = ranges.count * 3
+                DispatchQueue.concurrentPerform(iterations: totalReads) { i in
+                    let expertIdx = i / 3
+                    let projIdx = i % 3
+                    let r = ranges[expertIdx]
+                    switch projIdx {
+                    case 0:
+                        MLXFast.preadInto(gateBuffers[expertIdx], safetensorsPath: gateSSD.path,
+                                          tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                    case 1:
+                        MLXFast.preadInto(upBuffers[expertIdx], safetensorsPath: upSSD.path,
+                                          tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                    default:
+                        MLXFast.preadInto(downBuffers[expertIdx], safetensorsPath: downSSD.path,
+                                          tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                    }
+                }
+
+                // Lazy compute (no eval — next layer forces it)
+                let xGate = qGate.computeExperts(x, buffers: gateBuffers, ranges: ranges)
+                let xUp = qUp.computeExperts(x, buffers: upBuffers, ranges: ranges)
+                let intermediate = activation(xGate) * xUp
+                x = qDown.computeExperts(intermediate, buffers: downBuffers, ranges: ranges)
+            }
+
+            if doSort {
+                x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+            }
+            return MLX.squeezed(x, axis: -2)
+        }
+
+        // ── Fallback: original sequential path (non-SSD or non-quantized) ──
         let xUp = upProj(x, idx, sortedIndices: doSort)
         let xGate = gateProj(x, idx, sortedIndices: doSort)
         x = downProj(
@@ -209,80 +385,93 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 #endif
             }()
 
+            // ---- Parse expert ranges ----
+            var ranges = [ExpertRange]()
             while startIdx < cpuIndices.count {
-                let currentExpert = Int(cpuIndices[startIdx])
+                let eid = Int(cpuIndices[startIdx])
                 var endIdx = startIdx + 1
-                while endIdx < cpuIndices.count && Int(cpuIndices[endIdx]) == currentExpert {
-                    endIdx += 1
+                while endIdx < cpuIndices.count && Int(cpuIndices[endIdx]) == eid { endIdx += 1 }
+                ranges.append(ExpertRange(id: eid, start: startIdx, end: endIdx))
+                startIdx = endIdx
+            }
+
+            if let info = ssdInfo {
+                // ---- Batch-allocate weight buffers (1 eval for all) ----
+                var buffers = [MLXArray]()
+                for _ in ranges {
+                    buffers.append(MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype))
                 }
+                MLX.eval(buffers)
 
-                let rangeX = x[startIdx ..< endIdx]
-                let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
-
-                let readStart = DispatchTime.now().uptimeNanoseconds
-                let expertWeight: MLXArray
-                if let info = ssdInfo {
-                    // macOS PAPPS directNVMe: synchronous NVMe queue bypass with background caching.
-                    let w = MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype)
-                    MLX.eval(w)
+                // ---- Sequential pread into each fresh buffer ----
+                for (i, r) in ranges.enumerated() {
                     MLXFast.preadInto(
-                        w,
+                        buffers[i],
                         safetensorsPath: info.path,
                         tensorName: info.tensorName,
-                        expertIndex: UInt32(currentExpert)
+                        expertIndex: UInt32(r.id)
                     )
-                    expertWeight = w
-                } else {
-                    // iOS mmap / macOS mmapPageCache: page-cache backed slice.
-                    let w = self.weight[currentExpert ..< currentExpert + 1]
+                }
+
+                // ---- GPU compute for all experts ----
+                for (i, r) in ranges.enumerated() {
+                    let rangeX = x[r.start ..< r.end]
+                    let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
+                    let expertScales = self.scales[r.id ..< r.id + 1]
+                    var expertBiases: MLXArray? = nil
+                    if let b = self.biases { expertBiases = b[r.id ..< r.id + 1] }
+
+                    var expertOutput = MLX.gatherQuantizedMM(
+                        rangeX, buffers[i],
+                        scales: expertScales, biases: expertBiases,
+                        rhsIndices: expertIndices, transpose: true,
+                        groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+                    )
+                    if let bias = self.bias {
+                        let biasSlice = bias[r.id ..< r.id + 1]
+                        expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
+                    }
+                    let leadingShape = Array(rangeX.shape.dropLast())
+                    let canonicalShape = leadingShape + [self.outputDims]
+                    if expertOutput.shape != canonicalShape {
+                        expertOutput = expertOutput.reshaped(canonicalShape)
+                    }
+                    expertResults.append(expertOutput)
+                }
+            } else {
+                // iOS mmap fallback — original sequential path with per-expert eval
+                for r in ranges {
+                    let rangeX = x[r.start ..< r.end]
+                    let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
+                    let w = self.weight[r.id ..< r.id + 1]
                     MLX.eval(w)
                     MLXFast.prefault(w)
-                    expertWeight = w
+                    let expertScales = self.scales[r.id ..< r.id + 1]
+                    var expertBiases: MLXArray? = nil
+                    if let b = self.biases { expertBiases = b[r.id ..< r.id + 1] }
+                    var expertOutput = MLX.gatherQuantizedMM(
+                        rangeX, w,
+                        scales: expertScales, biases: expertBiases,
+                        rhsIndices: expertIndices, transpose: true,
+                        groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+                    )
+                    if let bias = self.bias {
+                        let biasSlice = bias[r.id ..< r.id + 1]
+                        expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
+                    }
+                    let leadingShape = Array(rangeX.shape.dropLast())
+                    let canonicalShape = leadingShape + [self.outputDims]
+                    if expertOutput.shape != canonicalShape {
+                        expertOutput = expertOutput.reshaped(canonicalShape)
+                    }
+                    MLX.eval(expertOutput)
+                    expertResults.append(expertOutput)
                 }
-                let readEnd = DispatchTime.now().uptimeNanoseconds
-                SSDStreamMetrics.shared.record(bytes: expertWeight.nbytes, timeNs: readEnd - readStart)
+            }
 
-                let expertScales = self.scales[currentExpert ..< currentExpert + 1]
-                var expertBiases: MLXArray? = nil
-                if let b = self.biases {
-                    expertBiases = b[currentExpert ..< currentExpert + 1]
-                }
-
-                var expertOutput = MLX.gatherQuantizedMM(
-                    rangeX,
-                    expertWeight,
-                    scales: expertScales,
-                    biases: expertBiases,
-                    rhsIndices: expertIndices,
-                    transpose: true,
-                    groupSize: self.groupSize,
-                    bits: self.bits,
-                    mode: mode,
-                    sortedIndices: true
-                )
-
-                if let bias = self.bias {
-                    let biasSlice = bias[currentExpert ..< currentExpert + 1]
-                    expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
-                }
-
-                // Normalize to a consistent shape before concatenation.
-                // gatherQuantizedMM can produce extra singleton dims (e.g. (1,1,1,1,D) vs
-                // (T,1,D)) depending on whether the weight came from directNVMe or mmap,
-                // causing the concatenated(expertResults, axis:0) to crash.
-                // Reshape to the canonical (..., 1, outputDims) that the caller expects.
-                let T = rangeX.dim(0)
-                let leadingShape = Array(rangeX.shape.dropLast())  // e.g. [T, 1] or [T]
-                let canonicalShape = leadingShape + [self.outputDims]
-                if expertOutput.shape != canonicalShape {
-                    expertOutput = expertOutput.reshaped(canonicalShape)
-                }
-
-                MLX.eval(expertOutput)
-                Stream.gpu.synchronize()
-
-                expertResults.append(expertOutput)
-                startIdx = endIdx
+            // Batch eval all expert outputs at once (directNVMe path)
+            if let _ = ssdInfo, !expertResults.isEmpty {
+                MLX.eval(expertResults)
             }
 
             if expertResults.isEmpty {
@@ -326,6 +515,79 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         return result
     }
 
+
+    // MARK: - Cross-projection batching helpers (SSD streaming)
+
+    /// Resolve the safetensors path and tensor name for SSD streaming.
+    public func resolveSSDInfo() -> (path: String, tensorName: String)? {
+        #if os(macOS)
+        guard ExpertStreamingConfig.shared.useDirectNVMe,
+              let tName = self.tensorName,
+              let filename = ExpertStreamerManager.shared?.getFile(for: tName),
+              let dir = ExpertStreamingConfig.shared.modelDirectory else { return nil }
+        let path = dir.appendingPathComponent(filename).path
+        return (path, tName)
+        #else
+        return nil
+        #endif
+    }
+
+    /// Allocate zero-filled weight buffers for `count` experts (lazy, not yet eval'd).
+    public func allocateExpertBuffers(_ count: Int) -> [MLXArray] {
+        var buffers = [MLXArray]()
+        for _ in 0..<count {
+            buffers.append(MLXArray.zeros([1, self.weight.dim(1), self.weight.dim(2)]).asType(self.weight.dtype))
+        }
+        return buffers
+    }
+
+    /// Load expert weights from SSD into pre-allocated (eval'd) buffers.
+    public func loadExpertWeights(_ buffers: [MLXArray], ranges: [ExpertRange], ssdInfo: (path: String, tensorName: String)) {
+        for (i, r) in ranges.enumerated() {
+            MLXFast.preadInto(
+                buffers[i],
+                safetensorsPath: ssdInfo.path,
+                tensorName: ssdInfo.tensorName,
+                expertIndex: UInt32(r.id)
+            )
+        }
+    }
+
+    /// Compute expert outputs using pre-loaded weight buffers. Returns LAZY result (no eval).
+    public func computeExperts(_ x: MLXArray, buffers: [MLXArray], ranges: [ExpertRange]) -> MLXArray {
+        var expertResults = [MLXArray]()
+        for (i, r) in ranges.enumerated() {
+            let rangeX = x[r.start ..< r.end]
+            let expertIndices = MLXArray.zeros([rangeX.dim(0)], type: UInt32.self)
+            let expertScales = self.scales[r.id ..< r.id + 1]
+            var expertBiases: MLXArray? = nil
+            if let b = self.biases { expertBiases = b[r.id ..< r.id + 1] }
+
+            var expertOutput = MLX.gatherQuantizedMM(
+                rangeX, buffers[i],
+                scales: expertScales, biases: expertBiases,
+                rhsIndices: expertIndices, transpose: true,
+                groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+            )
+            if let bias = self.bias {
+                let biasSlice = bias[r.id ..< r.id + 1]
+                expertOutput = expertOutput + MLX.expandedDimensions(biasSlice[expertIndices], axis: -2)
+            }
+            let leadingShape = Array(rangeX.shape.dropLast())
+            let canonicalShape = leadingShape + [self.outputDims]
+            if expertOutput.shape != canonicalShape {
+                expertOutput = expertOutput.reshaped(canonicalShape)
+            }
+            expertResults.append(expertOutput)
+        }
+
+        if expertResults.isEmpty {
+            var outShape = x.shape
+            outShape[outShape.count - 1] = self.outputDims
+            return MLXArray.zeros(outShape).asType(.float16)
+        }
+        return MLX.concatenated(expertResults, axis: 0)
+    }
 }
 
 public class ExpertStreamerManager {
