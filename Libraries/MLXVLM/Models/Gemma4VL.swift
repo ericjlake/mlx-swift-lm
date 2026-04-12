@@ -517,7 +517,11 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider, LayerPartitio
         // This MUST be done because we explicitly allocated a separate lm_head linear layer!
         if processed["lm_head.weight"] == nil || config.tieWordEmbeddings {
             // Check both prefixed and flat keys to be robust against different sanitization outputs
-            let embedKeys = ["model.embed_tokens.weight", "embed_tokens.weight", "model.embedTokens.weight", "embedTokens.weight"]
+            let prefix = "language_model."
+            let embedKeys = [
+                "\(prefix)model.embed_tokens.weight", "\(prefix)embed_tokens.weight", "\(prefix)model.embedTokens.weight", "\(prefix)embedTokens.weight",
+                "model.embed_tokens.weight", "embed_tokens.weight", "model.embedTokens.weight", "embedTokens.weight"
+            ]
             
             for key in embedKeys {
                 if let embedWeights = processed[key] {
@@ -528,7 +532,10 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider, LayerPartitio
             }
             
             // Repeat for scales/biases if present (quantized models)
-            let scaleKeys = ["model.embed_tokens.scales", "embed_tokens.scales", "model.embedTokens.scales", "embedTokens.scales"]
+            let scaleKeys = [
+                "\(prefix)model.embed_tokens.scales", "\(prefix)embed_tokens.scales", "\(prefix)model.embedTokens.scales", "\(prefix)embedTokens.scales",
+                "model.embed_tokens.scales", "embed_tokens.scales", "model.embedTokens.scales", "embedTokens.scales"
+            ]
             for key in scaleKeys {
                 if let embedScales = processed[key] {
                     processed["lm_head.scales"] = embedScales
@@ -536,7 +543,10 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider, LayerPartitio
                 }
             }
             
-            let biasKeys = ["model.embed_tokens.biases", "embed_tokens.biases", "model.embedTokens.biases", "embedTokens.biases"]
+            let biasKeys = [
+                "\(prefix)model.embed_tokens.biases", "\(prefix)embed_tokens.biases", "\(prefix)model.embedTokens.biases", "\(prefix)embedTokens.biases",
+                "model.embed_tokens.biases", "embed_tokens.biases", "model.embedTokens.biases", "embedTokens.biases"
+            ]
             for key in biasKeys {
                 if let embedBiases = processed[key] {
                     processed["lm_head.biases"] = embedBiases

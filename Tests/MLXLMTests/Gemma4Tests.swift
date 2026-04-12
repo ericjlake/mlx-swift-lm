@@ -41,7 +41,7 @@ struct Gemma4Tests {
     @Test("Gemma 4 Forward Pass - Determinism & Shape")
     func testGemma4ForwardPass() throws {
         let config = makeTinyConfig()
-        let model = Gemma4Model(config)
+        let model = Gemma4ModelInternal(config)
         
         let input = MLXArray(0..<8).reshaped(1, 8)
         let output = model(input)
@@ -56,7 +56,7 @@ struct Gemma4Tests {
     @Test("PLE Multimodal Signal Integrity")
     func testPLESignalIntegrity() throws {
         let config = makeTinyConfig()
-        let model = Gemma4Model(config)
+        let model = Gemma4ModelInternal(config)
         
         let input = MLXArray(Int32(0)..<Int32(5)).reshaped(1, 5)
         
@@ -70,7 +70,7 @@ struct Gemma4Tests {
     @Test("Weight Sanitization - PLE Mapping")
     func testGemma4Sanitization() throws {
         let config = makeTinyConfig()
-        let model = Gemma4Model(config)
+        let model = Gemma4ModelInternal(config)
         
         var weights = [String: MLXArray]()
         weights["model.layers.0.per_layer_conditioning.scale"] = MLXArray.ones([config.hiddenSize, config.hiddenSizePerLayerInput])
@@ -85,7 +85,7 @@ struct Gemma4Tests {
     @Test("Audio Configuration Dependency Safety")
     func testAudioConfigSafety() throws {
         let config = makeTinyConfig()
-        let model = Gemma4Model(config)
+        let model = Gemma4ModelInternal(config)
         #expect(model.model.layers.count == config.hiddenLayers)
     }
 }
