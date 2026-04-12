@@ -906,6 +906,9 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, LLMModel, KVCacheD
             }
             
             // 5. Expert router mapping
+            // Many HF exports use .router.weight, map into Swift's experts.router.proj structure
+            newK = newK.replacingOccurrences(of: ".router.weight", with: ".experts.router.proj.weight")
+            // Also handle any other .router keys (like scale, bias if they somehow exist)
             newK = newK.replacingOccurrences(of: ".router.", with: ".experts.router.")
             
             finalWeights[newK] = v
