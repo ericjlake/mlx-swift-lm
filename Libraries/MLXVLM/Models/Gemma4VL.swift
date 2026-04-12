@@ -459,6 +459,40 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
 
 // MARK: - Processor
 
+public struct Gemma4MessageGenerator: MessageGenerator {
+    public init() {}
+    
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        var textContent = message.content
+        
+        // Explicitly inject image tokens inline if they exist
+        let visualPrefix = Array(repeating: "<|image|>", count: message.images.count).joined(separator: "\n")
+        if !visualPrefix.isEmpty {
+            textContent = "\(visualPrefix)\n\(textContent)"
+        }
+        
+        // Explicitly inject audio tokens inline if they exist
+        let audioPrefix = Array(repeating: "<|audio|>", count: message.audio.count).joined(separator: "\n")
+        if !audioPrefix.isEmpty {
+            textContent = "\(audioPrefix)\n\(textContent)"
+        }
+        
+        var dict: [String: any Sendable] = [
+            "role": message.role.rawValue,
+            "content": textContent
+        ]
+        
+        if let toolCalls = message.toolCalls {
+            dict["tool_calls"] = toolCalls
+        }
+        if let toolCallId = message.toolCallId {
+            dict["tool_call_id"] = toolCallId
+        }
+        
+        return dict
+    }
+}
+
 public struct Gemma4Processor: UserInputProcessor {
     private let config: Gemma4ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -469,7 +503,7 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools)
 
         var processedImage: LMInput.ProcessedImage? = nil
