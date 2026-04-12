@@ -270,28 +270,36 @@ public class Gemma4RMSNormNoScale: Module {
 
 /// Proportional RoPE for Gemma 4 full-attention layers.
 ///
-/// Frequencies are computed relative to the full head dimension, and rotation is
-/// applied to the first rotated_dims//2 elements of each half of the head, matching
-/// the HF `rotate_half` convention used in the Python reference.
+/// Matches the Python `ProportionalRoPE` from `rope_utils.py`:
+/// frequencies are computed for the first `rotated_dims` dimensions,
+/// padded with `inf` for the remainder so the kernel leaves them unchanged.
 public class Gemma4ProportionalRoPE: Module, OffsetLayer {
     let dims: Int
     let traditional: Bool
-    let rotatedDims: Int
-    /// Stored as private; NOT a model parameter - computed at init from base/dims.
-    private var _computedFreqs: MLXArray?
+    /// Pre-computed frequencies: real freqs for rotated dims, inf for the rest.
+    private let _freqs: MLXArray
 
-    public init(dims: Int, traditional: Bool = false, base: Float = 10000.0, partialRotaryFactor: Float = 1.0) {
+    public init(dims: Int, traditional: Bool = false, base: Float = 10000.0,
+                partialRotaryFactor: Float = 1.0, factor: Float = 1.0) {
         self.dims = dims
         self.traditional = traditional
 
-        let ropeAngles = Int(partialRotaryFactor * Float(dims) / 2.0)
-        self.rotatedDims = 2 * ropeAngles
+        let rotatedDims = Int(partialRotaryFactor * Float(dims))
 
-        if rotatedDims > 0 {
-            let exponents = MLXArray(stride(from: Float(0), to: Float(rotatedDims), by: 2)) / Float(dims)
-            self._computedFreqs = MLXArray(base) ** exponents
+        // Compute real frequencies for the rotated portion
+        // Python: exponents = mx.arange(0, rotated_dims, 2) / dims
+        //         freqs = factor * (base ** exponents)
+        let exponents = MLXArray(stride(from: Float(0), to: Float(rotatedDims), by: 2)) / Float(dims)
+        let realFreqs = MLXArray(factor) * (MLXArray(base) ** exponents)
+
+        // Pad with inf for the non-rotated dimensions
+        // Python: mx.full(((dims - rotated_dims) // 2,), mx.inf)
+        let paddingCount = (dims - rotatedDims) / 2
+        if paddingCount > 0 {
+            let padding = MLXArray.full([paddingCount], values: MLXArray(Float.infinity))
+            self._freqs = concatenated([realFreqs, padding], axis: 0)
         } else {
-            self._computedFreqs = nil
+            self._freqs = realFreqs
         }
 
         super.init()
@@ -300,38 +308,15 @@ public class Gemma4ProportionalRoPE: Module, OffsetLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int) -> MLXArray {
-        guard rotatedDims > 0, let freqs = _computedFreqs else { return x }
-
-        let head = x[0..., 0..., 0..., 0..<dims]
-        let half = dims / 2
-
-        let left = head[0..., 0..., 0..., 0..<half]
-        let right = head[0..., 0..., 0..., half...]
-
-        let rotHalf = rotatedDims / 2
-
-        // Gather the rotated portions from each half
-        let leftRot = left[0..., 0..., 0..., 0..<rotHalf]
-        let rightRot = right[0..., 0..., 0..., 0..<rotHalf]
-        let rotated = concatenated([leftRot, rightRot], axis: -1)
-
-        // Apply standard RoPE with pre-computed freqs
-        let rotatedResult = MLXFast.RoPE(
-            rotated, dimensions: rotatedDims, traditional: traditional,
-            base: nil, scale: 1.0, offset: offset, freqs: freqs)
-
-        // Reconstruct: put rotated portions back into their halves
-        let leftPassthru = left[0..., 0..., 0..., rotHalf...]
-        let rightPassthru = right[0..., 0..., 0..., rotHalf...]
-
-        let newLeft = concatenated([rotatedResult[0..., 0..., 0..., 0..<rotHalf], leftPassthru], axis: -1)
-        let newRight = concatenated([rotatedResult[0..., 0..., 0..., rotHalf...], rightPassthru], axis: -1)
-
-        return concatenated([newLeft, newRight], axis: -1)
+        // Pass the full head to RoPE with inf-padded freqs.
+        // The kernel rotates only dims with finite frequencies, leaving the rest unchanged.
+        return MLXFast.RoPE(
+            x, dimensions: dims, traditional: traditional,
+            base: nil, scale: 1.0, offset: offset, freqs: _freqs)
     }
 }
 
-class Gemma4Attention: Module {
+public class Gemma4Attention: Module {
     let nHeads: Int
     let nKVHeads: Int
     let repeats: Int
@@ -346,16 +331,16 @@ class Gemma4Attention: Module {
     /// QK attention logit softcapping (Gemma 4 uses 30.0). 0 = disabled.
     let attnLogitSoftcap: Float
 
-    @ModuleInfo(key: "q_proj") var queryProj: Linear
-    @ModuleInfo(key: "k_proj") var keyProj: Linear
-    @ModuleInfo(key: "v_proj") var valueProj: Linear
-    @ModuleInfo(key: "o_proj") var outputProj: Linear
+    @ModuleInfo(key: "q_proj") public var queryProj: Linear
+    @ModuleInfo(key: "k_proj") public var keyProj: Linear
+    @ModuleInfo(key: "v_proj") public var valueProj: Linear
+    @ModuleInfo(key: "o_proj") public var outputProj: Linear
 
-    @ModuleInfo(key: "q_norm") var queryNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var keyNorm: RMSNorm
-    @ModuleInfo(key: "v_norm") var valueNorm: Gemma4RMSNormNoScale
+    @ModuleInfo(key: "q_norm") public var queryNorm: RMSNorm
+    @ModuleInfo(key: "k_norm") public var keyNorm: RMSNorm
+    @ModuleInfo(key: "v_norm") public var valueNorm: Gemma4RMSNormNoScale
 
-    @ModuleInfo var rope: OffsetLayer
+    @ModuleInfo public var rope: OffsetLayer
 
     init(_ config: Gemma4Configuration, layerIdx: Int) {
         let dim = config.hiddenSize
@@ -584,15 +569,15 @@ class Gemma4SparseMoeBlock: Module {
     }
 }
 
-class Gemma4TransformerBlock: Module {
-    @ModuleInfo(key: "self_attn") var selfAttention: Gemma4Attention
-    @ModuleInfo var mlp: Gemma4MLP
+public class Gemma4TransformerBlock: Module {
+    @ModuleInfo(key: "self_attn") public var selfAttention: Gemma4Attention
+    @ModuleInfo public var mlp: Gemma4MLP
     @ModuleInfo(key: "experts") var expertsBlock: Gemma4SparseMoeBlock?
 
-    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-    @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: RMSNorm
-    @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm: RMSNorm
+    @ModuleInfo(key: "input_layernorm") public var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") public var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "pre_feedforward_layernorm") public var preFeedforwardLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_feedforward_layernorm") public var postFeedforwardLayerNorm: RMSNorm
 
     // MoE specific norms
     @ModuleInfo(key: "post_feedforward_layernorm_1") var postFeedforwardLayerNorm1: RMSNorm?
@@ -604,7 +589,7 @@ class Gemma4TransformerBlock: Module {
     @ModuleInfo(key: "per_layer_projection") var perLayerProjectionLayer: Linear?
     @ModuleInfo(key: "post_per_layer_input_norm") var postPerLayerInputNorm: RMSNorm?
 
-    @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
+    @ModuleInfo(key: "layer_scalar") public var layerScalar: MLXArray
 
     let numAttentionHeads: Int
     let hiddenSize: Int
@@ -709,9 +694,14 @@ class Gemma4TransformerBlock: Module {
            let proj = perLayerProjectionLayer,
            let norm = postPerLayerInputNorm
         {
-            var gated = gate(x + residualUpdates) // Wait, Gemma 4 conditions on accumulated state? Let's assume yes.
+            // GATE: Gated by current state + updates
+            var gated = gate(x + residualUpdates) 
             gated = geluApproximate(gated)
+            
+            // MIX: Hadamard product with per-layer conditioning vector
             gated = gated * pli
+            
+            // RESIDUAL: Project back, norm, and add to updates
             gated = proj(gated)
             gated = norm(gated)
             residualUpdates = residualUpdates + gated
@@ -727,11 +717,11 @@ class Gemma4TransformerBlock: Module {
 // Reference: https://github.com/SharpAI/mlx-swift-lm/pull/1
 public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
-    @ModuleInfo var layers: [Gemma4TransformerBlock]
+    @ModuleInfo public var layers: [Gemma4TransformerBlock]
     @ModuleInfo var norm: RMSNorm
 
     // Per-layer conditioning weights (Gemma 4 architectural novelty)
-    @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
+    @ModuleInfo(key: "embed_tokens_per_layer") public var embedTokensPerLayer: Embedding?
     @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
@@ -813,18 +803,17 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             let nL = config.hiddenLayers
             let D = config.hiddenSizePerLayerInput
 
-            // Token-based per-layer embeddings, scaled by sqrt(hiddenSizePerLayerInput)
+            // Token-based per-layer embeddings
             let tokenScale = MLXArray(sqrt(Float(D))).asType(h.dtype)
             var tokenEmbeds = (embedPerLayer(inputs) * tokenScale)
                 .reshaped(B, L, nL, D)  // [B, L, numLayers, D]
 
-            // MASK OUT MULTIMODAL TOKENS: We must zero out their text-space embeddings 
-            // so they don't corrupt the multimodal visual/audio vectors in the per-layer stream
+            // MASK OUT MULTIMODAL TOKENS: Zero out text-space embeddings for visual/audio tokens
             let isTextToken = MLX.logicalOr(MLX.less(inputs, MLXArray(258880)), MLX.greater(inputs, MLXArray(258884)))
             let expandedMask = isTextToken.reshaped([B, L, 1, 1]).asType(tokenEmbeds.dtype)
             tokenEmbeds = tokenEmbeds * expandedMask
 
-            // Project main embeddings, scale by 1/sqrt(hiddenSize), reshape, then norm
+            // Project main embeddings, scale, reshape, then norm
             let projScale = MLXArray(1.0 / sqrt(Float(config.hiddenSize))).asType(h.dtype)
             let modelProjected = (modelProj(h) * projScale)
                 .reshaped(B, L, nL, D)  // [B, L, numLayers, D]
@@ -882,70 +871,49 @@ public class Gemma4Model: Module, LLMModel {
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray] {
-        var processedWeights = weights
-
-        let unflattened = ModuleParameters.unflattened(weights)
-        if let lm = unflattened["language_model"] {
-            processedWeights = Dictionary(uniqueKeysWithValues: lm.flattened())
-        }
-
-        let expectedVocab = config.vocabularySize
-        let keysToCheck = [
-            "model.embed_tokens.weight", "model.embed_tokens.scales", "model.embed_tokens.biases",
-            "lm_head.weight", "lm_head.scales", "lm_head.biases",
-        ]
-        for key in keysToCheck {
-            if let tensor = processedWeights[key], tensor.dim(0) > expectedVocab {
-                processedWeights[key] = tensor[0 ..< expectedVocab]
-            }
-        }
-        
         var finalWeights = [String: MLXArray]()
-        for (k, v) in processedWeights {
-            if k.contains("self_attn.rotary_emb") || k.contains("input_max") || k.contains("input_min") || k.contains("output_max") || k.contains("output_min") {
+        
+        for (k, v) in weights {
+            var newK = k
+            
+            // 1. Strip top-level VLM/Omni prefixes and filter out non-language-model keys
+            if newK.hasPrefix("language_model.") {
+                newK = String(newK.dropFirst("language_model.".count))
+            } else if !newK.hasPrefix("model.") && !newK.hasPrefix("lm_head.") {
+                // Ignore multimodal tower keys (vision_tower, audio_tower, etc)
                 continue
             }
-            if k.hasSuffix(".experts.gate_up_proj.weight") {
-                 let base = k.replacingOccurrences(of: ".experts.gate_up_proj.weight", with: ".experts.switch_glu")
-                 let parts = MLX.split(v, parts: 2, axis: -2)
-                 finalWeights["\(base).gate_proj.weight"] = parts[0]
-                 finalWeights["\(base).up_proj.weight"] = parts[1]
-                 continue
+            
+            // 2. Filter out unnecessary rotary or quantization metadata
+            if newK.contains("self_attn.rotary_emb") || newK.contains("input_max") || newK.contains("input_min") || newK.contains("output_max") || newK.contains("output_min") {
+                continue
             }
-            if k.hasSuffix(".experts.down_proj.weight") {
-                 let base = k.replacingOccurrences(of: ".experts.down_proj.weight", with: ".experts.switch_glu.down_proj.weight")
-                 finalWeights[base] = v
-                 continue
+            
+            // 3. Handle root-level PLE naming divergence
+            if newK.hasPrefix("model.per_layer_projection.") {
+                newK = newK.replacingOccurrences(of: "model.per_layer_projection", with: "model.per_layer_model_projection")
             }
-            let newK = k.replacingOccurrences(of: ".router.", with: ".experts.router.")
+
+            // 4. Experts gate splitting (Gemma 4 MoE)
+            if newK.hasSuffix(".experts.gate_up_proj.weight") {
+                  let base = newK.replacingOccurrences(of: ".experts.gate_up_proj.weight", with: ".experts.switch_glu")
+                  let parts = MLX.split(v, parts: 2, axis: -2)
+                  finalWeights["\(base).gate_proj.weight"] = parts[0]
+                  finalWeights["\(base).up_proj.weight"] = parts[1]
+                  continue
+            }
+            if newK.hasSuffix(".experts.down_proj.weight") {
+                  let base = newK.replacingOccurrences(of: ".experts.down_proj.weight", with: ".experts.switch_glu.down_proj.weight")
+                  finalWeights[base] = v
+                  continue
+            }
+            
+            // 5. Expert router mapping
+            newK = newK.replacingOccurrences(of: ".router.", with: ".experts.router.")
+            
             finalWeights[newK] = v
         }
 
-        // Explicitly map per_layer_projection_norm to ensure it survives flattening
-        if let normWeight = weights["language_model.model.per_layer_projection_norm.weight"] {
-            finalWeights["model.per_layer_projection_norm.weight"] = normWeight
-        } else if let normWeight = weights["model.per_layer_projection_norm.weight"] {
-            finalWeights["model.per_layer_projection_norm.weight"] = normWeight
-        }
-
-        // Handle mixed-quantization: MLP and MoE experts might be 8-bit while other layers are 4-bit.
-        for i in 0..<config.hiddenLayers {
-            let wKey = "model.layers.\(i).experts.router.proj.weight"
-            let sKey = "model.layers.\(i).experts.router.proj.scales"
-            let bKey = "model.layers.\(i).experts.router.proj.biases"
-            if let packedW = finalWeights[wKey],
-               let scales = finalWeights[sKey],
-               let biases = finalWeights[bKey] {
-                let bits = 32 * packedW.shape.last! / (scales.shape.last! * 64)
-                finalWeights[wKey] = MLX.dequantized(
-                    packedW, scales: scales, biases: biases, groupSize: 64, bits: bits)
-                finalWeights.removeValue(forKey: sKey)
-                finalWeights.removeValue(forKey: bKey)
-            }
-        }
-
-        // Per-layer conditioning weights are now fully implemented and loaded normally.
-        
         // Gemma 4 shares k_proj weights with v_proj in some layers (or all)
         for i in 0..<config.hiddenLayers {
             let kWeightKey = "model.layers.\(i).self_attn.k_proj.weight"

@@ -494,6 +494,20 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
             processed["vision_tower.std_bias"] = zeros([visionConfig.hiddenSize]).asType(activationDtype)
         }
         
+        // Finalize tied word embeddings copy, overriding the standard fallback.
+        // This MUST be done because we explicitly allocated a separate lm_head linear layer!
+        if processed["lm_head.weight"] == nil || config.tieWordEmbeddings {
+            if let embedWeights = processed["model.embed_tokens.weight"] {
+                processed["lm_head.weight"] = embedWeights
+            }
+            if let embedScales = processed["model.embed_tokens.scales"] {
+                processed["lm_head.scales"] = embedScales
+            }
+            if let embedBiases = processed["model.embed_tokens.biases"] {
+                processed["lm_head.biases"] = embedBiases
+            }
+        }
+        
         return processed
     }
 }
