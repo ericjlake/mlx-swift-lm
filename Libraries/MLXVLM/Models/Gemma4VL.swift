@@ -384,7 +384,11 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
         let visionOutputs = visionTower(pixelValues)
         
         // Project to text dimension
-        let imageFeatures = projector(visionOutputs)
+        let imageFeaturesOutput = projector(visionOutputs)
+        
+        // Gemma mathematically requires the projections to be scaled up by sqrt(hiddenSize) to match text embedding magnitude
+        let imageScale = MLXArray(Float(config.hiddenSize).squareRoot()).asType(imageFeaturesOutput.dtype)
+        let imageFeatures = imageFeaturesOutput * imageScale
         
         let imageTokenId = 258880 // Or config if present
         
@@ -405,7 +409,11 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
         
         if let audioValues = audioValues, let audioTower = audioTower, let audioProjector = audioProjector {
             let audioOutputs = audioTower(audioValues)
-            let audioFeatures = audioProjector(audioOutputs)
+            let audioFeaturesOutput = audioProjector(audioOutputs)
+            
+            let audioScale = MLXArray(Float(config.hiddenSize).squareRoot()).asType(audioFeaturesOutput.dtype)
+            let audioFeatures = audioFeaturesOutput * audioScale
+            
             let audioTokenId = 258881
             
             let audioTokenCount = inputIds.asArray(Int.self).filter { $0 == audioTokenId }.count

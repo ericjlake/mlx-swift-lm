@@ -936,8 +936,15 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             if let inputs = inputs {
                 // Token-based per-layer embeddings, scaled by sqrt(hiddenSizePerLayerInput)
                 let tokenScale = MLXArray(sqrt(Float(D))).asType(h.dtype)
-                let tokenEmbeds = (embedPerLayer(inputs) * tokenScale)
+                var tokenEmbeds = (embedPerLayer(inputs) * tokenScale)
                     .reshaped(B, L, nL, D)  // [B, L, numLayers, D]
+                
+                // MASK OUT MULTIMODAL TOKENS: We must zero out their text-space embeddings 
+                // so they don't corrupt the multimodal visual/audio vectors in the per-layer stream
+                let isTextToken = MLX.logicalOr(MLX.less(inputs, MLXArray(258880)), MLX.greater(inputs, MLXArray(258884)))
+                // Expand mask from [B, L] to [B, L, 1, 1] for broadcasting
+                let expandedMask = isTextToken.expandedDimensions(axes: [2, 3]).asType(tokenEmbeds.dtype)
+                tokenEmbeds = tokenEmbeds * expandedMask
 
                 // Model projection: scale by 1/sqrt(hidden_size) per reference
                 // per_layer_model_projection_scale = hidden_size ** -0.5
