@@ -509,6 +509,12 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             }
         }
         set {
+            if newValue.isEmpty {
+                self.keys = nil
+                self.values = nil
+                self.offset = 0
+                return
+            }
             guard newValue.count == 2 else {
                 fatalError("KVCacheSimple state must have exactly 2 arrays (keys, values)")
             }
@@ -614,7 +620,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return concatenated(toCat, axis: 2)
     }
 
-    private func temporalOrder(_ array: MLXArray) -> MLXArray {
+    public func temporallyOrdered(_ array: MLXArray) -> MLXArray {
         // Rearrange the cache into temporal order, slicing off the end if unused
         if idx == array.dim(2) {
             return array
@@ -636,8 +642,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.values = values
         } else {
             // Put the keys/values in temporal order to preserve context
-            self.keys = temporalOrder(self.keys!)
-            self.values = temporalOrder(self.values!)
+            self.keys = temporallyOrdered(self.keys!)
+            self.values = temporallyOrdered(self.values!)
             idx = self.keys!.dim(2)
 
             // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
@@ -735,6 +741,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             }
         }
         set {
+            if newValue.isEmpty {
+                self.keys = nil
+                self.values = nil
+                return
+            }
             guard newValue.count == 2 else {
                 fatalError("RotatingKVCache state must have exactly 2 arrays")
             }
