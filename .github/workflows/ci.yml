@@ -59,6 +59,11 @@ jobs:
           # Verify PLE signal stability with full kernel support
           swift test --filter Gemma4StabilizationTests --skip-build
 
+      - name: Speculative Decoding Protection Gate
+        run: |
+          # Ensure speculative decoding parity and cache integrity are never regressed
+          swift test --filter SpeculativeDecodingTests --skip-build
+
       - name: Upload test results on failure
         if: failure()
         uses: actions/upload-artifact@v4

@@ -334,7 +334,15 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
         
         self._visionTower.wrappedValue = Gemma4VisionModel(config: vcfg)
         self._projector.wrappedValue = Gemma4Projector(visionDim: vcfg.hiddenSize, textDim: config.hiddenSize)
-        
+        if let acfg = config.audioConfig {
+            let audioConfig = Gemma4AudioConfiguration(
+                modelType: acfg.modelType ?? "gemma4_audio",
+                hiddenSize: acfg.hiddenSize ?? 1024,
+                numHiddenLayers: acfg.numHiddenLayers ?? 12,
+                numAttentionHeads: acfg.numAttentionHeads ?? 8,
+                outputProjDims: acfg.outputProjDims ?? 1536
+            )
+            self._audioTower.wrappedValue = Gemma4AudioModel(config: audioConfig)
             self._audioProjector.wrappedValue = Gemma4Projector(visionDim: audioConfig.outputProjDims, textDim: config.hiddenSize)
         } else {
             print("[Gemma4VL] DEBUG: config.audioConfig IS NIL!")
