@@ -71,6 +71,7 @@ public struct Gemma4Configuration: Codable {
     public let moeIntermediateSize: Int?
     public let numGlobalKeyValueHeads: Int
     public let tieWordEmbeddings: Bool
+    public let enableMoeBlock: Bool
 
     /// Fraction of global head_dim used for RoPE (default 0.25 for Gemma 4 global attn)
     public let globalRopePartialFactor: Float?
@@ -115,7 +116,8 @@ public struct Gemma4Configuration: Codable {
         finalLogitSoftcapping: Float = 0.0,
         attnLogitSoftcap: Float = 0.0,
         audioConfig: Gemma4AudioConfig? = nil,
-        visionConfig: Gemma4VisionConfigProxy? = nil
+        visionConfig: Gemma4VisionConfigProxy? = nil,
+        enableMoeBlock: Bool? = nil
     ) {
         self.audioConfig = audioConfig
         self.visionConfig = visionConfig
@@ -150,6 +152,7 @@ public struct Gemma4Configuration: Codable {
         self.globalRopePartialFactor = globalRopePartialFactor
         self.finalLogitSoftcapping = finalLogitSoftcapping
         self.attnLogitSoftcap = attnLogitSoftcap
+        self.enableMoeBlock = enableMoeBlock ?? (numExperts != nil && numExperts! > 0)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -180,6 +183,7 @@ public struct Gemma4Configuration: Codable {
         case numExperts = "num_experts"
         case topKExperts = "top_k_experts"
         case moeIntermediateSize = "moe_intermediate_size"
+        case enableMoeBlock = "enable_moe_block"
         // Per-layer conditioning
         case hiddenSizePerLayerInput = "hidden_size_per_layer_input"
         case vocabSizePerLayerInput = "vocab_size_per_layer_input"
@@ -199,6 +203,7 @@ public struct Gemma4Configuration: Codable {
         case textConfig = "text_config"
         case audioConfig = "audio_config"
         case visionConfig = "vision_config"
+        case enableMoeBlock = "enable_moe_block"
     }
 
     public init(from decoder: Decoder) throws {
@@ -224,6 +229,9 @@ public struct Gemma4Configuration: Codable {
         numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts)
         topKExperts = try container.decodeIfPresent(Int.self, forKey: .topKExperts)
         moeIntermediateSize = try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize)
+
+        let enableMoeOpt = try container.decodeIfPresent(Bool.self, forKey: .enableMoeBlock)
+        enableMoeBlock = enableMoeOpt ?? (self.numExperts != nil && self.numExperts! > 0)
         numGlobalKeyValueHeads = try container.decodeIfPresent(Int.self, forKey: .numGlobalKeyValueHeads) ?? (try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? 1)
         hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 1152
         hiddenLayers = try container.decodeIfPresent(Int.self, forKey: .hiddenLayers) ?? 26
@@ -710,7 +718,7 @@ class Gemma4TransformerBlock: Module {
         }
         self.mlp = Gemma4MLP(dimensions: config.hiddenSize, hiddenDimensions: mlpSize)
 
-        self.isMoe = config.numExperts != nil && config.numExperts! > 0
+        self.isMoe = config.enableMoeBlock
         
         if self.isMoe {
             let numExperts = config.numExperts ?? 1
