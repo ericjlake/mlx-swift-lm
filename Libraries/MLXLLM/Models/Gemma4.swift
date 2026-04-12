@@ -10,27 +10,43 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+public struct Gemma4VisionConfigurationProxy: Codable, Sendable {
+    public let hiddenSize: Int?
+    public let hiddenLayers: Int?
+    public let intermediateSize: Int?
+    public let attentionHeads: Int?
+    public let patchSize: Int?
+}
+
+public struct Gemma4AudioConfigurationProxy: Codable, Sendable {
+    public let modelType: String
+    public let hiddenSize: Int
+    public let numHiddenLayers: Int
+    public let numAttentionHeads: Int
+    public let outputProjDims: Int?
+}
+
 public struct Gemma4Configuration: Codable {
-    let modelType: String
-    let hiddenSize: Int
-    let hiddenLayers: Int
-    let intermediateSize: Int
-    let attentionHeads: Int
-    let headDim: Int
-    let rmsNormEps: Float
-    let vocabularySize: Int
-    let kvHeads: Int
-    let ropeTheta: Float
-    let ropeLocalBaseFreq: Float
-    let ropeTraditional: Bool
-    let queryPreAttnScalar: Float?
-    let slidingWindow: Int
-    let slidingWindowPattern: Int
-    let maxPositionEmbeddings: Int
-    let ropeScaling: [String: StringOrNumber]?
-    let globalHeadDim: Int
-    let numKvSharedLayers: Int
-    let useDoubleWideMlp: Bool
+    public let modelType: String
+    public let hiddenSize: Int
+    public let hiddenLayers: Int
+    public let intermediateSize: Int
+    public let attentionHeads: Int
+    public let headDim: Int
+    public let rmsNormEps: Float
+    public let vocabularySize: Int
+    public let kvHeads: Int
+    public let ropeTheta: Float
+    public let ropeLocalBaseFreq: Float
+    public let ropeTraditional: Bool
+    public let queryPreAttnScalar: Float?
+    public let slidingWindow: Int
+    public let slidingWindowPattern: Int
+    public let maxPositionEmbeddings: Int
+    public let ropeScaling: [String: StringOrNumber]?
+    public let globalHeadDim: Int
+    public let numKvSharedLayers: Int
+    public let useDoubleWideMlp: Bool
     
     // MoE / Global KV Configurations
     public let numExperts: Int?
@@ -41,13 +57,16 @@ public struct Gemma4Configuration: Codable {
     public let enableMoeBlock: Bool
 
     /// Fraction of global head_dim used for RoPE (default 0.25 for Gemma 4 global attn)
-    let globalRopePartialFactor: Float
+    public let globalRopePartialFactor: Float
     /// Final logit softcapping value (0 = disabled). Gemma 4 uses 30.0.
-    let finalLogitSoftcapping: Float
+    public let finalLogitSoftcapping: Float
     /// Per-layer conditioning dimension (0 = disabled)
-    let hiddenSizePerLayerInput: Int
+    public let hiddenSizePerLayerInput: Int
     /// Vocabulary size for per-layer embedding table (0 = disabled)
-    let vocabSizePerLayerInput: Int
+    public let vocabSizePerLayerInput: Int
+    
+    public let visionConfig: Gemma4VisionConfigurationProxy?
+    public let audioConfig: Gemma4AudioConfigurationProxy?
 
     public init(
         modelType: String, hiddenSize: Int, hiddenLayers: Int, intermediateSize: Int,
@@ -62,7 +81,9 @@ public struct Gemma4Configuration: Codable {
         hiddenSizePerLayerInput: Int = 0, vocabSizePerLayerInput: Int = 0,
         globalRopePartialFactor: Float = 0.25,
         finalLogitSoftcapping: Float = 0.0,
-        enableMoeBlock: Bool? = nil
+        enableMoeBlock: Bool? = nil,
+        visionConfig: Gemma4VisionConfigurationProxy? = nil,
+        audioConfig: Gemma4AudioConfigurationProxy? = nil
     ) {
         self.modelType = modelType
         self.hiddenSize = hiddenSize
@@ -94,12 +115,14 @@ public struct Gemma4Configuration: Codable {
         self.globalRopePartialFactor = globalRopePartialFactor
         self.finalLogitSoftcapping = finalLogitSoftcapping
         self.enableMoeBlock = enableMoeBlock ?? (numExperts != nil && numExperts! > 0)
+        self.visionConfig = visionConfig
+        self.audioConfig = audioConfig
     }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
-        case hiddenSize = "hidden_size"
         case hiddenLayers = "num_hidden_layers"
+        case hiddenSize = "hidden_size"
         case intermediateSize = "intermediate_size"
         case attentionHeads = "num_attention_heads"
         case headDim = "head_dim"
@@ -107,7 +130,6 @@ public struct Gemma4Configuration: Codable {
         case vocabularySize = "vocab_size"
         case kvHeads = "num_key_value_heads"
         case ropeTheta = "rope_theta"
-        case ropeLocalBaseFreq = "rope_local_base_freq"
         case ropeTraditional = "rope_traditional"
         case queryPreAttnScalar = "query_pre_attn_scalar"
         case slidingWindow = "sliding_window"
@@ -117,18 +139,23 @@ public struct Gemma4Configuration: Codable {
         case globalHeadDim = "global_head_dim"
         case numKvSharedLayers = "num_kv_shared_layers"
         case useDoubleWideMlp = "use_double_wide_mlp"
-        case tieWordEmbeddings = "tie_word_embeddings"
-        case numGlobalKeyValueHeads = "num_global_key_value_heads"
+        case ropeLocalBaseFreq = "rope_local_base_freq"
+
         // MoE
         case numExperts = "num_experts"
-        case topKExperts = "top_k_experts"
+        case topKExperts = "num_experts_per_tok"
+        case tieWordEmbeddings = "tie_word_embeddings"
         case moeIntermediateSize = "moe_intermediate_size"
+        case numGlobalKeyValueHeads = "num_global_key_value_heads"
         case enableMoeBlock = "enable_moe_block"
-        // Per-layer conditioning
+        
+        // Per-layer cond
         case hiddenSizePerLayerInput = "hidden_size_per_layer_input"
         case vocabSizePerLayerInput = "vocab_size_per_layer_input"
         // Logit softcapping
         case finalLogitSoftcapping = "final_logit_softcapping"
+        case visionConfig = "vision_config"
+        case audioConfig = "audio_config"
     }
 
     // Top-level keys (outside text_config)
@@ -188,6 +215,10 @@ public struct Gemma4Configuration: Codable {
         // Per-layer conditioning
         self.hiddenSizePerLayerInput = try container.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
         self.vocabSizePerLayerInput = try container.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
+        
+        self.visionConfig = try container.decodeIfPresent(Gemma4VisionConfigurationProxy.self, forKey: .visionConfig)
+        self.audioConfig = try container.decodeIfPresent(Gemma4AudioConfigurationProxy.self, forKey: .audioConfig)
+
         // Parse partial_rotary_factor for global attention from rope_parameters.full_attention
         // Gemma 4 uses only 25% of global_head_dim (512) for positional encoding = 128 rotated dims.
         struct AC: CodingKey {
@@ -679,7 +710,7 @@ class Gemma4TransformerBlock: Module {
 // SSD expert streaming, bridging the missing protocols from Damon Janis's initial draft.
 // Reference: https://github.com/SharpAI/mlx-swift-lm/pull/1
 public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     @ModuleInfo var layers: [Gemma4TransformerBlock]
     @ModuleInfo var norm: RMSNorm
 
@@ -688,7 +719,7 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
-    let config: Gemma4Configuration
+    public let config: Gemma4Configuration
 
     // LayerPartitionable
     public var gpuLayerCount: Int? = nil
@@ -697,7 +728,7 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
     // StreamableMoE
     public var streamExperts: Bool = false
 
-    init(_ config: Gemma4Configuration) {
+    public init(_ config: Gemma4Configuration) {
         self.config = config
 
         self._embedTokens.wrappedValue = Embedding(
@@ -730,11 +761,11 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
         super.init()
     }
 
-    func callAsFunction(
-        _ inputs: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+    public func callAsFunction(
+        _ inputs: MLXArray, inputEmbedding: MLXArray? = nil, mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache?]? = nil
     ) -> MLXArray {
-        var h = embedTokens(inputs)
+        var h = inputEmbedding ?? embedTokens(inputs)
         // Python reference: h = h * self.embed_scale where embed_scale = hidden_size**0.5
         h = h * MLXArray(Float(config.hiddenSize).squareRoot())
         var layerCache = cache
