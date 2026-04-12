@@ -32,14 +32,14 @@ public struct THW: Sendable {
 ///
 /// The ``ModelContext`` holds the ``UserInputProcessor`` associated with a
 /// ``LanguageModel``.
-public struct LMInput {
+public struct LMInput: Sendable {
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
     public let audio: ProcessedAudio?
 
     /// Representation of tokenized input text.
-    public struct Text {
+    public struct Text: Sendable {
 
         /// input token array
         public let tokens: MLXArray
@@ -66,7 +66,7 @@ public struct LMInput {
     }
 
     /// Representation of prepared input image(s).
-    public struct ProcessedImage {
+    public struct ProcessedImage: Sendable {
 
         /// Concatenated pixels from one or more images
         public let pixels: MLXArray
@@ -83,7 +83,7 @@ public struct LMInput {
 
     /// Representation of prepared input video(s).
     /// For now, this is virtually identical to ProcessedImage.
-    public struct ProcessedVideo {
+    public struct ProcessedVideo: Sendable {
 
         public let pixels: MLXArray
         public let frames: [THW]?
@@ -97,7 +97,7 @@ public struct LMInput {
     }
 
     /// Representation of prepared input audio.
-    public struct ProcessedAudio {
+    public struct ProcessedAudio: Sendable {
         public let features: MLXArray
         public let seqLengths: [Int]?
 
@@ -128,7 +128,7 @@ public struct LMInput {
 
 /// ``LanguageModel`` step output. This is consumed internally
 /// by the ``TokenIterator``.
-public struct LMOutput {
+public struct LMOutput: Sendable {
 
     /// logits (one hot vector of probabilities for tokens)
     public let logits: MLXArray
@@ -136,7 +136,7 @@ public struct LMOutput {
     /// optional ``State`` to carry forward into the next step
     public let state: State?
 
-    public struct State {
+    public struct State: Sendable {
         public let crossAttentionStates: MLXArray?
 
         public init(crossAttentionStates: MLXArray? = nil) {
@@ -151,7 +151,7 @@ public struct LMOutput {
 }
 
 /// The result of the call to ``LanguageModel/prepare(_:cache:windowSize:)``
-public enum PrepareResult {
+public enum PrepareResult: Sendable {
     /// tokens to process by the ``TokenIterator``
     case tokens(LMInput.Text)
 
@@ -167,7 +167,7 @@ public enum PrepareResult {
 /// - calls ``prepare(_:cache:windowSize:)`` to initialize the KVCache and consume the prompt
 /// - calls ``callAsFunction(_:cache:state:)-9kuvf`` for each token, producing an ``LMOutput``
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
-public protocol LanguageModel: Module {
+public protocol LanguageModel: Module, Sendable {
 
     /// Prepare the cache state and consume the ``LMInput``.
     ///
