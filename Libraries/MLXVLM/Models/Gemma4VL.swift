@@ -321,9 +321,13 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider {
         self.visionConfig = vcfg
         
         self._languageModel.wrappedValue = Gemma4ModelInternal(config)
-        if !config.tieWordEmbeddings {
-            self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
-        }
+        
+        // Always create a separate lm_head — following the Gemma 3 pattern.
+        // For tied embeddings, sanitize() will copy embed_tokens weights to lm_head.
+        // This ensures logit projection uses QuantizedLinear.quantizedMM rather than
+        // QuantizedEmbedding.asLinear, which is critical for numerical accuracy.
+        self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
+        
         self._visionTower.wrappedValue = Gemma4VisionModel(config: vcfg)
         self._projector.wrappedValue = Gemma4Projector(visionDim: vcfg.hiddenSize, textDim: config.hiddenSize)
         super.init()

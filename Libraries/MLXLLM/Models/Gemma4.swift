@@ -285,19 +285,22 @@ public class Gemma4RMSNormNoScale: Module {
     }
 }
 
-/// Standard Gemma 4 RMSNorm with (1.0 + weight) shift.
+/// Standard Gemma 4 RMSNorm with direct weight scaling.
+/// Unlike Gemma 1/2/3 which use additive-delta weights (1.0 + weight),
+/// Gemma 4 stores the actual scale values directly in the checkpoint.
+/// HF reference: normed_output = self._norm(x) * self.weight
 public class Gemma4RMSNorm: Module {
     public let weight: MLXArray
     public let eps: Float
 
     public init(dimensions: Int, eps: Float = 1e-6) {
-        self.weight = MLXArray.zeros([dimensions])
+        self.weight = MLXArray.ones([dimensions])
         self.eps = eps
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return MLXFast.rmsNorm(x, weight: MLXArray(Float(1.0)) + self.weight, eps: self.eps)
+        return MLXFast.rmsNorm(x, weight: self.weight, eps: self.eps)
     }
 }
 
@@ -385,8 +388,8 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "v_proj") var valueProj: Linear
     @ModuleInfo(key: "o_proj") var outputProj: Linear
 
-    @ModuleInfo(key: "q_norm") var queryNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var keyNorm: RMSNorm
+    @ModuleInfo(key: "q_norm") var queryNorm: Gemma4RMSNorm
+    @ModuleInfo(key: "k_norm") var keyNorm: Gemma4RMSNorm
     @ModuleInfo(key: "v_norm") var valueNorm: Gemma4RMSNormNoScale
 
     @ModuleInfo var rope: OffsetLayer
@@ -418,20 +421,20 @@ class Gemma4Attention: Module {
 
         self._queryProj.wrappedValue = Linear(dim, nHeads * self.headDim, bias: false)
         self._outputProj.wrappedValue = Linear(nHeads * self.headDim, dim, bias: false)
-        self._queryNorm.wrappedValue = RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
+        self._queryNorm.wrappedValue = Gemma4RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
 
         // Unused dummy modules for shared layers that still exist in the checkpoint
         if !self.isKVSharedLayer {
             self._keyProj.wrappedValue = Linear(dim, nKVHeads * self.headDim, bias: false)
             self._valueProj.wrappedValue = Linear(dim, nKVHeads * self.headDim, bias: false)
-            self._keyNorm.wrappedValue = RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
+            self._keyNorm.wrappedValue = Gemma4RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
             // vNorm is purely unscaled RMS
             self._valueNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
         } else {
             // Unused modules for shared layers to satisfy @ModuleInfo matching the checkpoint shapes
             self._keyProj.wrappedValue = Linear(dim, nKVHeads * self.headDim, bias: false)
             self._valueProj.wrappedValue = Linear(dim, nKVHeads * self.headDim, bias: false)
-            self._keyNorm.wrappedValue = RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
+            self._keyNorm.wrappedValue = Gemma4RMSNorm(dimensions: self.headDim, eps: config.rmsNormEps)
             self._valueNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
         }
 
@@ -491,12 +494,6 @@ class Gemma4Attention: Module {
             values = valueNorm(values)
             
             keys = rope(keys, offset: LCache)
-            
-            if let cache = cache {
-                let (ck, cv) = cache.update(keys: keys, values: values)
-                keys = ck
-                values = cv
-            }
         }
 
         let output: MLXArray
@@ -504,7 +501,18 @@ class Gemma4Attention: Module {
             // Gemma 4 uses QK attention logit softcapping before softmax:
             //   scores = tanh(scores / cap) * cap  (llama.cpp llm_build_gemma4_iswa)
             // MLXFast.scaledDotProductAttention has no softcap parameter, so we do it manually.
-            let (cachedKeys, cachedValues) = cache?.update(keys: keys, values: values) ?? (keys, values)
+            let cachedKeys: MLXArray
+            let cachedValues: MLXArray
+            if isKVSharedLayer {
+                // Shared layers already receive the full KV history directly.
+                // Do NOT call cache.update because it would repeatedly append the full history!
+                cachedKeys = keys
+                cachedValues = values
+            } else {
+                let kvTuple = cache?.update(keys: keys, values: values) ?? (keys, values)
+                cachedKeys = kvTuple.0
+                cachedValues = kvTuple.1
+            }
             var fullKeys = cachedKeys
             var fullValues = cachedValues
             // TurboKV decode if needed
@@ -530,27 +538,32 @@ class Gemma4Attention: Module {
                 v = MLX.repeated(v, count: repeats, axis: 1)
             }
             // scores: [B, nH, L, S]
-            var scores = (queries * scale).matmul(k.transposed(0, 1, 3, 2))
+            // We MUST upcast to float32 before the matmul!
+            // queryPreAttnScalar (256.0) forces the Float16 dot product to easily exceed the 65504
+            // capacity limit during accumulation, leading to Inf/NaN outputs and gibberish token generation.
+            var scores = (queries.asType(.float32) * scale).matmul(k.asType(.float32).transposed(0, 1, 3, 2))
+
             // Apply QK softcap FIRST: tanh(scores / cap) * cap
             // Critically, we MUST evaluate tanh in float32 to avoid saturation.
             // Also critically, this MUST be before the mask, otherwise -1e9 mask gets clipped to -30.0!
-            let originalType = scores.dtype
-            let scoresF32 = scores.asType(.float32)
             let cap = MLXArray(attnLogitSoftcap).asType(.float32)
-            scores = (MLX.tanh(scoresF32 / cap) * cap).asType(originalType)
+            scores = (MLX.tanh(scores / cap) * cap)
             
             // Apply attention mask AFTER softcap
             if let maskArray = mask.mask {
-                scores = scores + maskArray
+                scores = scores + maskArray.asType(.float32)
             }
             
             // Softmax + weighted sum
-            let attnWeights = MLX.softmax(scores.asType(.float32), axis: -1).asType(scores.dtype)
+            let attnWeights = MLX.softmax(scores, axis: -1).asType(v.dtype)
             output = matmul(attnWeights, v)
         } else {
+            // Unsoftcapped attention logic (natively handles update internally)
+            // If caching is meant to bypass (i.e. shared layer), pass nil
+            let activeCache = isKVSharedLayer ? nil : cache
             output = attentionWithCacheUpdate(
                 queries: queries, keys: keys, values: values,
-                cache: cache, scale: scale, mask: mask)
+                cache: activeCache, scale: scale, mask: mask)
         }
         return outputProj(
             output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
@@ -874,6 +887,8 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             fatalError("Either inputs or inputEmbedding must be provided")
         }
 
+
+
         var layerCache = cache
         if layerCache == nil {
             if config.numKvSharedLayers > 0 {
@@ -889,9 +904,9 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             ? createAttentionMask(h: h, cache: cache?[0], windowSize: config.slidingWindow)
             : .none
 
-        // DIAGNOSTIC: Temporarily disable per-layer inputs to isolate base transformer
+        // DIAGNOSTIC: Re-enabling per-layer inputs for text generation stability.
         var perLayerInputs: MLXArray? = nil
-        let _disablePerLayer = true  // REQUIRED for multi-modal Vision/Audio tokens
+        let _disablePerLayer = false  // Set to false to enable per-layer conditioning
         if !_disablePerLayer, config.hiddenSizePerLayerInput > 0,
            let embedPerLayer = embedTokensPerLayer,
            let modelProj = perLayerModelProjection,
@@ -947,9 +962,18 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             if let block = layer as? Gemma4TransformerBlock, block.selfAttention.isKVSharedLayer {
                 let sourceIdx = isGlobal ? lastGlobal : lastSliding
                 if sourceIdx >= 0, let sourceCache = layerCache?[sourceIdx], sourceCache.state.count >= 2 {
-                    let state = sourceCache.state
+                    let k: MLXArray
+                    let v: MLXArray
+                    if let rotating = sourceCache as? RotatingKVCache, let keys = rotating.innerState().first, let values = rotating.innerState().last {
+                        k = rotating.temporallyOrdered(keys)
+                        v = rotating.temporallyOrdered(values)
+                    } else {
+                        let state = sourceCache.state
+                        k = state[0]
+                        v = state[1]
+                    }
                     let ropeOffset = max(0, sourceCache.offset - h.dim(1))
-                    sharedKV = (state[0], state[1], ropeOffset)
+                    sharedKV = (k, v, ropeOffset)
                 } else {
                     sharedKV = nil
                 }
@@ -960,6 +984,7 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
             h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts, cacheToEval: layerCache?[i]) {
                 layer(h, mask: layerMask, cache: layerCache?[i], perLayerInput: pli, sharedKV: sharedKV)
             }
+
         }
         return norm(h)
     }
@@ -976,19 +1001,18 @@ public class Gemma4Model: Module, LLMModel {
     public init(_ config: Gemma4Configuration) {
         self.config = config
         self.model = Gemma4ModelInternal(config)
-        if !config.tieWordEmbeddings {
-            self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
-        }
+        // Always create a separate lm_head — following the Gemma 3 pattern.
+        // For tied embeddings, sanitize() will copy embed_tokens weights to lm_head.
+        // This ensures logit projection uses QuantizedLinear.quantizedMM rather than
+        // QuantizedEmbedding.asLinear, which is critical for numerical accuracy.
+        self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
         super.init()
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var out = model(inputs, mask: nil, cache: cache)
-        if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
-        }
+        out = lmHead!(out)
+
         // Apply final logit softcapping (Python reference line 579-580)
         if config.finalLogitSoftcapping > 0 {
             let originalType = out.dtype
@@ -1084,23 +1108,16 @@ public class Gemma4Model: Module, LLMModel {
                 }
             }
         }
-        
-        // MLX Swift's QuantizedEmbedding can sometimes cause silent evaluation bugs
-        // Let's manually dequantize embed_tokens and embed_tokens_per_layer here
-        for prefix in ["model.embed_tokens", "model.embed_tokens_per_layer"] {
-             let wKey = "\(prefix).weight"
-             let sKey = "\(prefix).scales"
-             let bKey = "\(prefix).biases"
-             if let packedW = finalWeights[wKey],
-                let scales = finalWeights[sKey],
-                let biases = finalWeights[bKey] {
-                 print("DEBUG: Manually dequantizing \(prefix) with scales \(scales.shape) and packed \(packedW.shape)")
-                 let bits = 32 * packedW.shape.last! / (scales.shape.last! * 64)
-                 finalWeights[wKey] = MLX.dequantized(
-                     packedW, scales: scales, biases: biases, groupSize: 64, bits: bits)
-                 finalWeights.removeValue(forKey: sKey)
-                 finalWeights.removeValue(forKey: bKey)
-             }
+        // For tied word embeddings, copy embed_tokens weights to lm_head.
+        // This follows the Gemma 3 pattern — the load pipeline will auto-quantize
+        // lm_head into QuantizedLinear, giving us numerically correct quantizedMM
+        // for logit projection instead of the less precise Embedding.asLinear.
+        if finalWeights["lm_head.weight"] == nil {
+            ["weight", "scales", "biases"].forEach { key in
+                if let embedWeight = finalWeights["model.embed_tokens.\(key)"] {
+                    finalWeights["lm_head.\(key)"] = embedWeight
+                }
+            }
         }
         
         return finalWeights
