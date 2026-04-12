@@ -765,9 +765,14 @@ public class Gemma4ModelInternal: Module, LayerPartitionable, StreamableMoE {
         _ inputs: MLXArray, inputEmbedding: MLXArray? = nil, mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache?]? = nil
     ) -> MLXArray {
-        var h = inputEmbedding ?? embedTokens(inputs)
-        // Python reference: h = h * self.embed_scale where embed_scale = hidden_size**0.5
-        h = h * MLXArray(Float(config.hiddenSize).squareRoot())
+        var h: MLXArray
+        if let inputEmbedding = inputEmbedding {
+            h = inputEmbedding
+        } else {
+            h = embedTokens(inputs)
+            // Python reference: h = h * self.embed_scale where embed_scale = hidden_size**0.5
+            h = h * MLXArray(Float(config.hiddenSize).squareRoot())
+        }
         var layerCache = cache
         if layerCache == nil {
             layerCache = Array(repeating: nil as KVCache?, count: layers.count)

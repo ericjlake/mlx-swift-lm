@@ -640,19 +640,13 @@ public struct Gemma4Processor: UserInputProcessor {
             let audioPadding = Array(repeating: audioTokenId, count: expectedAudioTokens)
             // The Omni processor injects a bound sequence: [boaToken (255010), -1, -1, ..., eoaToken (255011)]
             // We find this spatial anchor, eradicate it, and natively map the exact audio dimensionality block to this anchor.
-            let boaToken = 255010
-            let eoaToken = 255011
-            
             let gemmaBoa = 256000 // <|audio>
             let gemmaEoa = 258883 // <audio|>
             
-            if let targetIdx = expandedTokens.firstIndex(of: boaToken),
-               let endIdx = expandedTokens.firstIndex(of: eoaToken) {
-                expandedTokens.removeSubrange(targetIdx...endIdx)
-                expandedTokens.insert(contentsOf: [gemmaBoa] + audioPadding + [gemmaEoa], at: targetIdx)
-            } 
-            else if let targetIdx = expandedTokens.firstIndex(of: audioTokenId) {
-                expandedTokens.removeAll(where: { $0 == audioTokenId })
+            // The MessageGenerator injected <|audio|> strings which the tokenizer resolves to gemmaBoa (256000).
+            // Find this anchor and replace it with a properly bounded and padded audio feature array.
+            if let targetIdx = expandedTokens.firstIndex(of: gemmaBoa) {
+                expandedTokens.remove(at: targetIdx)
                 expandedTokens.insert(contentsOf: [gemmaBoa] + audioPadding + [gemmaEoa], at: targetIdx)
             } else {
                 // Fallback to BOS + 1 if completely unformatted
