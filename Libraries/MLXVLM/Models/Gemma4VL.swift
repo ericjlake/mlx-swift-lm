@@ -223,7 +223,7 @@ private class Gemma4PatchEmbedder: Module {
             outputChannels: config.hiddenSize,
             kernelSize: [config.patchSize, config.patchSize],
             stride: [config.patchSize, config.patchSize],
-            bias: true
+            bias: false
         )
         // Set the parameter directly. MLX requires Module parameters to be either Module or explicitly managed MLXArrays. 
         self.position_embedding_table = zeros([2, 10240, config.hiddenSize])
@@ -278,7 +278,7 @@ private class Gemma4Projector: Module, UnaryLayer {
     @ModuleInfo(key: "embedding_projection") var projection: any UnaryLayer
     
     init(visionDim: Int, textDim: Int) {
-        self._projection.wrappedValue = Linear(visionDim, textDim)
+        self._projection.wrappedValue = Linear(visionDim, textDim, bias: false)
         super.init()
     }
     
@@ -478,6 +478,19 @@ public class Gemma4VL: Module, VLMModel, KVCacheDimensionProvider, LayerPartitio
                     continue
                 }
                 
+                // Fix MLX Conv2d spatial scrambling: Hugging Face SigLIP patch extractors are often linear layers
+                // which export flat [O, C*H*W] -> [768, 768] weights. MLX Conv2d correctly expects [O, H, W, C].
+                // We must reshape to PyTorch native [O, C, H, W] then transpose to MLX Conv native!
+                if newK == "vision_tower.patch_embedder.input_proj.weight" && v.ndim == 2 {
+                    let outChannels = v.dim(0)
+                    let spatialChannels = v.dim(1)
+                    if spatialChannels == visionConfig.numChannels * visionConfig.patchSize * visionConfig.patchSize {
+                        let reshaped = v.reshaped([outChannels, visionConfig.numChannels, visionConfig.patchSize, visionConfig.patchSize])
+                        processed[newK] = reshaped.transposed(0, 2, 3, 1)
+                        continue
+                    }
+                }
+                
                 processed[newK] = v
             }
         }
@@ -600,7 +613,10 @@ public struct Gemma4Processor: UserInputProcessor {
             
             // If the chat template completely dropped the image tokens, inject them manually!
             if expandedTokens.count == promptTokens.count && !promptTokens.contains(imageTokenId) {
-                let imagePad = Array(repeating: imageTokenId, count: numTokens)
+                var imagePad = [255999] // <|image>
+                imagePad.append(contentsOf: Array(repeating: imageTokenId, count: numTokens))
+                imagePad.append(258882) // <image|>
+                
                 if expandedTokens.first == 2 {
                     // Inject right after BOS (2)
                     expandedTokens.insert(contentsOf: imagePad, at: 1)
@@ -638,9 +654,12 @@ public struct Gemma4Processor: UserInputProcessor {
             let expectedAudioTokens = layer1Length
             
             var expandedTokens = promptTokens
-            let audioPadding = Array(repeating: audioTokenId, count: expectedAudioTokens)
             let gemmaBoa = 256000 // <|audio>
             let gemmaEoa = 258883 // <audio|>
+            
+            var audioPadding = [gemmaBoa]
+            audioPadding.append(contentsOf: Array(repeating: audioTokenId, count: expectedAudioTokens))
+            audioPadding.append(gemmaEoa)
             
             // The MessageGenerator injected <|audio|> strings which tokenizer resolves to audioTokenId (258881)
             // Determine insertion point before wiping ALL instances.
