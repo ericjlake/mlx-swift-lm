@@ -125,7 +125,8 @@ private class SubsampleConvProjection: Module {
         
         // Output from layer 1: [B, L/4, 128/4, outChannels=32]
         let (B, L_new, F_new, C_new) = (hidden.dim(0), hidden.dim(1), hidden.dim(2), hidden.dim(3))
-        hidden = hidden.reshaped(B, L_new, F_new * C_new) // Flatten features
+        
+        hidden = hidden.reshaped([B, L_new, F_new * C_new]) // Flatten features
         
         return inputProjLinear(hidden)
     }

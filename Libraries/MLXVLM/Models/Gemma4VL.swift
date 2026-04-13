@@ -656,12 +656,12 @@ public struct Gemma4Processor: UserInputProcessor {
             if let idx = targetIdx {
                 // Re-clamp the index in case removeAll shifted it out of bounds
                 let safeIdx = min(idx, expandedTokens.count)
-                expandedTokens.insert(contentsOf: [gemmaBoa] + audioPadding + [gemmaEoa], at: safeIdx)
+                expandedTokens.insert(contentsOf: audioPadding, at: safeIdx)
             } else {
                 if expandedTokens.first == 2 {
-                    expandedTokens.insert(contentsOf: [gemmaBoa] + audioPadding + [gemmaEoa], at: 1)
+                    expandedTokens.insert(contentsOf: audioPadding, at: 1)
                 } else {
-                    expandedTokens.insert(contentsOf: [gemmaBoa] + audioPadding + [gemmaEoa], at: 0)
+                    expandedTokens.insert(contentsOf: audioPadding, at: 0)
                 }
             }
             print("[Gemma4Processor] Tokenizer count after audio insertion: \(expandedTokens.count)")
