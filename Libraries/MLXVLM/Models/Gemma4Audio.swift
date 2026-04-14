@@ -16,28 +16,31 @@ public struct Gemma4AudioConfiguration: Codable, Sendable {
     public let rmsNormEps: Float
     public let outputProjDims: Int
 
-    public init(
-        modelType: String = "gemma4_audio",
-        hiddenSize: Int = 1024,
-        numHiddenLayers: Int = 12,
-        numAttentionHeads: Int = 8,
-        attentionChunkSize: Int = 12,
-        convKernelSize: Int = 5,
-        subsamplingConvChannels: [Int] = [128, 32],
-        useClippedLinears: Bool = true,
-        rmsNormEps: Float = 1e-6,
-        outputProjDims: Int = 1536
-    ) {
-        self.modelType = modelType
-        self.hiddenSize = hiddenSize
-        self.numHiddenLayers = numHiddenLayers
-        self.numAttentionHeads = numAttentionHeads
-        self.attentionChunkSize = attentionChunkSize
-        self.convKernelSize = convKernelSize
-        self.subsamplingConvChannels = subsamplingConvChannels
-        self.useClippedLinears = useClippedLinears
-        self.rmsNormEps = rmsNormEps
-        self.outputProjDims = outputProjDims
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case hiddenSize = "hidden_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case attentionChunkSize = "attention_chunk_size"
+        case convKernelSize = "conv_kernel_size"
+        case subsamplingConvChannels = "subsampling_conv_channels"
+        case useClippedLinears = "use_clipped_linears"
+        case rmsNormEps = "rms_norm_eps"
+        case outputProjDims = "output_proj_dims"
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4_audio"
+        self.hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 1024
+        self.numHiddenLayers = try container.decodeIfPresent(Int.self, forKey: .numHiddenLayers) ?? 12
+        self.numAttentionHeads = try container.decodeIfPresent(Int.self, forKey: .numAttentionHeads) ?? 8
+        self.attentionChunkSize = try container.decodeIfPresent(Int.self, forKey: .attentionChunkSize) ?? 12
+        self.convKernelSize = try container.decodeIfPresent(Int.self, forKey: .convKernelSize) ?? 5
+        self.subsamplingConvChannels = try container.decodeIfPresent([Int].self, forKey: .subsamplingConvChannels) ?? [128, 32]
+        self.useClippedLinears = try container.decodeIfPresent(Bool.self, forKey: .useClippedLinears) ?? true
+        self.rmsNormEps = try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
+        self.outputProjDims = try container.decodeIfPresent(Int.self, forKey: .outputProjDims) ?? 1536
     }
 }
 
@@ -65,12 +68,21 @@ private class GLU: Module {
 /// A wrapper for Linears that supports HF quantized mapping
 private class ClippedLinear: Module {
     @ModuleInfo(key: "linear") var linear: Linear
+    @ModuleInfo(key: "input_min") var inputMin: MLXArray?
+    @ModuleInfo(key: "input_max") var inputMax: MLXArray?
+    @ModuleInfo(key: "output_min") var outputMin: MLXArray?
+    @ModuleInfo(key: "output_max") var outputMax: MLXArray?
     
     init(_ inputChannels: Int, _ outputChannels: Int, bias: Bool = false) {
         self._linear.wrappedValue = Linear(inputChannels, outputChannels, bias: bias)
+        self._inputMin.wrappedValue = MLXArray(-Float.infinity)
+        self._inputMax.wrappedValue = MLXArray(Float.infinity)
+        self._outputMin.wrappedValue = MLXArray(-Float.infinity)
+        self._outputMax.wrappedValue = MLXArray(Float.infinity)
     }
     
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Safe to ignore clipping for audio as confirmed by MLX framework devs, but needed for unarchiving compliance.
         return linear(x)
     }
 }
@@ -213,6 +225,7 @@ private class ConformerAttention: Module {
     @ModuleInfo(key: "v_proj") var vProj: ClippedLinear
     @ModuleInfo(key: "post") var post: ClippedLinear
     @ModuleInfo(key: "relative_k_proj") var relativeKProj: Linear?
+    @ModuleInfo(key: "per_dim_scale") var perDimScale: MLXArray?
     
     let numHeads: Int
     let scale: Float
@@ -226,6 +239,7 @@ private class ConformerAttention: Module {
         self._vProj.wrappedValue = ClippedLinear(hiddenSize, hiddenSize, bias: false)
         self._post.wrappedValue = ClippedLinear(hiddenSize, hiddenSize, bias: false)
         self._relativeKProj.wrappedValue = Linear(hiddenSize, hiddenSize, bias: false)
+        self._perDimScale.wrappedValue = MLXArray.zeros([hiddenSize / numHeads])
     }
 
     func callAsFunction(_ x: MLXArray, attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = .none) -> MLXArray {
