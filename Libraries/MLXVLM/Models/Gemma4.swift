@@ -1719,8 +1719,16 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 let actualAudioMask = audioMask ?? MLXArray.zeros(audioValues.shape[0..<2], dtype: .bool)
                 let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
                 let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
-                
-                var audioMaskExpanded = expandedDimensions(inputIds .== audioTokenId, axis: -1)
+
+                let audioTokenMask = inputIds .== audioTokenId
+                let audioTokenCount = audioTokenMask.asType(.int32).sum().item(Int.self)
+                let audioFeatureCount = audioFeatures.dim(1)
+                guard audioTokenCount == audioFeatureCount else {
+                    print("[Gemma4] Audio token count mismatch: prompt has \(audioTokenCount) audio tokens but tower produced \(audioFeatureCount) feature vectors. Skipping audio injection.")
+                    return (inputsEmbeds, perLayerInputs)
+                }
+
+                var audioMaskExpanded = expandedDimensions(audioTokenMask, axis: -1)
                 audioMaskExpanded = broadcast(audioMaskExpanded, to: inputsEmbeds.shape)
                 inputsEmbeds = gemma4MaskedScatter(
                     inputTensor: inputsEmbeds,
@@ -1912,10 +1920,14 @@ public struct Gemma4Processor: UserInputProcessor {
             let (features, mask) = processor.extract(waveform: samples)
             print("[Omni Debug] Extracted \(features.shape) features. Mean: \(features.mean().item(Float.self)), Min: \(features.min().item(Float.self)), Max: \(features.max().item(Float.self))")
             
-            // Expected audio token calc: ceil(audio_duration_ms / 40)
-            let durationMs = Float(samples.count) / 16000.0 * 1000.0
-            var expectedAudioTokens = Int(ceil(durationMs / 40.0))
-            expectedAudioTokens = min(expectedAudioTokens, 750) // audio_seq_length cap
+            // Expected audio token count: mirrors the audio tower's two stride-2 conv2d layers,
+            // each with 1-sample symmetric padding (MLX.padded [1,1] in time axis).
+            // Layer formula: ceil(T/2) applied twice → ceil(ceil(numMelFrames/2)/2).
+            // This avoids off-by-one vs. duration/40ms approximation.
+            let numMelFrames = features.dim(1)
+            let afterLayer0 = (numMelFrames + 1) / 2  // ceil(T/2)
+            var expectedAudioTokens = (afterLayer0 + 1) / 2  // ceil(L1/2)
+            expectedAudioTokens = min(expectedAudioTokens, 750)  // audio_seq_length cap
             
             let seqLength = features.dim(1)
             processedAudio = LMInput.ProcessedAudio(features: features, mask: mask, seqLengths: [seqLength])
