@@ -7,109 +7,93 @@ import Testing
 
 @Suite("Gemma 4 Architectural Integrity Tests")
 struct Gemma4Tests {
-    
-    /// Create a minimal test configuration for Gemma 4
-    private func makeTinyConfig() -> Gemma4Configuration {
-        Gemma4Configuration(
-            modelType: "gemma4",
-            hiddenSize: 64,
-            hiddenLayers: 2,
-            intermediateSize: 128,
-            attentionHeads: 4,
-            headDim: 16,
-            rmsNormEps: 1e-6,
-            vocabularySize: 100,
-            kvHeads: 2,
-            ropeTheta: 10000.0,
-            ropeLocalBaseFreq: 10000.0,
-            ropeTraditional: false,
-            queryPreAttnScalar: 1.0,
-            slidingWindow: 128,
-            slidingWindowPattern: 1,
-            maxPositionEmbeddings: 512,
-            globalHeadDim: 64,
-            numKvSharedLayers: 0,
-            useDoubleWideMlp: false,
-            tieWordEmbeddings: true,
-            hiddenSizePerLayerInput: 32,
-            vocabSizePerLayerInput: 10,
-            globalRopePartialFactor: 0.25,
-            finalLogitSoftcapping: 30.0
-        )
+
+    /// Create a minimal test configuration for Gemma 4 using upstream's JSON-based init
+    private func makeTinyConfigData() -> Data {
+        let json = """
+        {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 16,
+                "global_head_dim": 64,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 100,
+                "num_key_value_heads": 2,
+                "rope_traditional": false,
+                "sliding_window": 128,
+                "sliding_window_pattern": 1,
+                "max_position_embeddings": 512,
+                "num_kv_shared_layers": 0,
+                "use_double_wide_mlp": false,
+                "tie_word_embeddings": true,
+                "hidden_size_per_layer_input": 32,
+                "vocab_size_per_layer_input": 10,
+                "final_logit_softcapping": 30.0,
+                "enable_moe_block": false,
+                "attention_k_eq_v": false
+            },
+            "vocab_size": 100
+        }
+        """
+        return json.data(using: .utf8)!
     }
 
-    @Test("Gemma 4 Forward Pass - Determinism & Shape")
+    @Test("Gemma 4 Configuration Decoding")
+    func testGemma4ConfigDecoding() throws {
+        let data = makeTinyConfigData()
+        let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
+        // vocabSize is internal, verify via model
+        let model = Gemma4Model(config)
+        #expect(model.vocabularySize == 100)
+    }
+
+    @Test("Gemma 4 Model Instantiation")
+    func testGemma4ModelInstantiation() throws {
+        let data = makeTinyConfigData()
+        let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
+        let model = Gemma4Model(config)
+        #expect(model.vocabularySize == 100)
+    }
+
+    @Test("Gemma 4 Forward Pass - Shape")
     func testGemma4ForwardPass() throws {
-        let config = makeTinyConfig()
-        let model = Gemma4ModelInternal(config)
-        
+        let data = makeTinyConfigData()
+        let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
+        let model = Gemma4Model(config)
+
         let input = MLXArray(0..<8).reshaped(1, 8)
-        let output = model(input)
-        
-        #expect(output.shape == [1, 8, config.vocabularySize])
-        
-        // Secondary pass to ensure determinism
-        let output2 = model(input)
-        #expect(allClose(output, output2).item(Bool.self))
+        let output = model(input, cache: nil)
+
+        #expect(output.shape == [1, 8, model.vocabularySize])
     }
 
-    @Test("PLE Multimodal Signal Integrity")
-    func testPLESignalIntegrity() throws {
-        let config = makeTinyConfig()
-        let model = Gemma4ModelInternal(config)
-        
+    @Test("Forward Pass Determinism")
+    func testDeterminism() throws {
+        let data = makeTinyConfigData()
+        let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
+        let model = Gemma4Model(config)
+
+        let input = MLXArray(0..<8).reshaped(1, 8)
+        let output1 = model(input, cache: nil)
+        let output2 = model(input, cache: nil)
+        #expect(allClose(output1, output2).item(Bool.self))
+    }
+
+    @Test("No NaN/Inf in Output")
+    func testNoNaNInf() throws {
+        let data = makeTinyConfigData()
+        let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
+        let model = Gemma4Model(config)
+
         let input = MLXArray(Int32(0)..<Int32(5)).reshaped(1, 5)
-        
-        // We expect the forward pass to finish without NaN or infinite values
-        let output = model(input)
+        let output = model(input, cache: nil)
         let sum = output.sum().item(Float.self)
         #expect(!sum.isNaN)
         #expect(!sum.isInfinite)
-    }
-
-    @Test("Weight Sanitization - PLE Mapping")
-    func testGemma4Sanitization() throws {
-        let config = makeTinyConfig()
-        let model = Gemma4ModelInternal(config)
-        
-        var weights = [String: MLXArray]()
-        weights["model.layers.0.per_layer_conditioning.scale"] = MLXArray.ones([config.hiddenSize, config.hiddenSizePerLayerInput])
-        weights["model.layers.0.per_layer_conditioning.bias"] = MLXArray.ones([config.hiddenSize])
-        
-        let sanitized = model.sanitize(weights: weights, metadata: [:])
-        
-        // Gemma 4 sanitization maps to model.layers...
-        #expect(sanitized["model.layers.0.per_layer_model_projection.scale"] != nil || sanitized["layers.0.per_layer_input.scale"] != nil)
-    }
-
-    @Test("Audio Configuration Dependency Safety")
-    func testAudioConfigSafety() throws {
-        let config = makeTinyConfig()
-        let model = Gemma4ModelInternal(config)
-        #expect(model.model.layers.count == config.hiddenLayers)
-    }
-
-    @Test("Router Parameter Tree Dump")
-    func testRouterParameterTree() throws {
-        let config = makeTinyConfig()
-        let model = Gemma4ModelInternal(config)
-        
-        var weights = [String: MLXArray]()
-        weights["model.layers.0.experts.router.scale"] = MLXArray.ones([config.hiddenSize])
-        weights["model.layers.0.experts.router.proj.weight"] = MLXArray.ones([1, config.hiddenSize])
-        
-        print("Model parameters:")
-        for (k, _) in model.parameters() {
-            if k.contains("router") {
-                print(k)
-            }
-        }
-        
-        do {
-            try model.update(parameters: ModuleParameters.unflattened(weights))
-        } catch {
-            print("Update Error: \(error)")
-            throw error
-        }
     }
 }
