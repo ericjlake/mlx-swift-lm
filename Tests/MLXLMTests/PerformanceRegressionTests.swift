@@ -57,7 +57,7 @@ extension MLXTestingSuite {
         for _ in 0..<tokenCount {
             let a = MLXRandom.uniform(0..<1, [1, 64, 512])
             let b = MLXRandom.uniform(0..<1, [1, 512, 1024])
-            let _ = a * b
+            let _ = matmul(a, b)
             MLX.eval()
         }
         
