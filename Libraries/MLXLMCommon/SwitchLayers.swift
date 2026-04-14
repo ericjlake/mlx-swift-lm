@@ -176,7 +176,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
 
                     // Full concurrent pread (baseline path)
                     let totalReads = ranges.count * 3
-                    DispatchQueue.concurrentPerform(iterations: totalReads) { i in
+                    DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                         let expertIdx = i / 3
                         let projIdx = i % 3
                         let r = ranges[expertIdx]
@@ -299,7 +299,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
                         // Pread only misses (~30% of experts, ~6 reads at QD=6)
                         if !missInfo.isEmpty {
                             let totalMissReads = missInfo.count * 3
-                            DispatchQueue.concurrentPerform(iterations: totalMissReads) { i in
+                            DispatchQueue.concurrentPerform(iterations: totalMissReads) { [missInfo] i in
                                 let mIdx = i / 3
                                 let proj = i % 3
                                 let info = missInfo[mIdx]
@@ -330,7 +330,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
                             usedDown.append(_persistentDown![i])
                         }
                         let totalReads = ranges.count * 3
-                        DispatchQueue.concurrentPerform(iterations: totalReads) { i in
+                        DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                             let expertIdx = i / 3
                             let projIdx = i % 3
                             let r = ranges[expertIdx]
@@ -394,7 +394,7 @@ public class SwitchGLU: Module, @unchecked Sendable {
 
                 // Concurrent pread (same as fast path)
                 let totalReads = ranges.count * 3
-                DispatchQueue.concurrentPerform(iterations: totalReads) { i in
+                DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                     let expertIdx = i / 3
                     let projIdx = i % 3
                     let r = ranges[expertIdx]
