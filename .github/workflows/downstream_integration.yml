@@ -44,17 +44,17 @@ jobs:
         run: swift package resolve
         working-directory: SwiftLM
 
-      - name: Build SwiftLM (Release)
-        run: swift build -c release --build-tests
+      - name: Build SwiftLM
+        run: swift build --build-tests
         working-directory: SwiftLM
 
       - name: Install MLX Metal library
         run: |
           python3 -m venv /tmp/mlx_venv
           /tmp/mlx_venv/bin/pip install --quiet mlx
-          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib SwiftLM/.build/release/
+          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib SwiftLM/.build/debug/ || echo "No debug metal lib"
           find SwiftLM/.build -type d -name "MLXLMTests" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/ \;
 
       - name: Run SwiftLM Integration Tests
-        run: swift test -c release --parallel --skip-build
+        run: swift test --parallel --skip-build
         working-directory: SwiftLM
