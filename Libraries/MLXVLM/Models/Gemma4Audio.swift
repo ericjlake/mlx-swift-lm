@@ -258,7 +258,7 @@ private class ConformerLightConv1d: Module {
     @ModuleInfo(key: "pre_layer_norm") var preLayerNorm: AudioRMSNorm
     @ModuleInfo(key: "linear_start") var linearStart: ClippedLinear
     @ModuleInfo(key: "depthwise_conv1d") var depthwiseConv1d: Conv1d
-    @ModuleInfo(key: "conv_norm") var convNorm: AudioLayerNorm
+    @ModuleInfo(key: "conv_norm") var convNorm: AudioRMSNorm
     @ModuleInfo(key: "linear_end") var linearEnd: ClippedLinear
     
     let causalPadding: Int
@@ -281,7 +281,7 @@ private class ConformerLightConv1d: Module {
             bias: false
         )
 
-        self._convNorm.wrappedValue = AudioLayerNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._convNorm.wrappedValue = AudioRMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._linearEnd.wrappedValue = ClippedLinear(config.hiddenSize, config.hiddenSize, bias: false)
     }
 
