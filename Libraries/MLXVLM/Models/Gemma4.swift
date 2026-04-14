@@ -1686,7 +1686,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     private func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
-        audioValues: MLXArray? = nil
+        audioValues: MLXArray? = nil,
+        audioMask: MLXArray? = nil
     ) throws -> (MLXArray, MLXArray?) {
         var inputsEmbeds = languageModel.model.embedTokens(inputIds)
         inputsEmbeds =
@@ -1715,7 +1716,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
         guard let pixelValues else {
             if let audioValues = audioValues, let audioTower = audioTower, let embedAudio = embedAudio, let audioTokenId = config.audioTokenId {
-                let audioOutputs = audioTower(audioValues)
+                let actualAudioMask = audioMask ?? MLXArray.zeros(audioValues.shape[0..<2], dtype: .bool)
+                let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
                 let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
                 
                 var audioMaskExpanded = expandedDimensions(inputIds .== audioTokenId, axis: -1)
@@ -1750,19 +1752,18 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         )
 
         if let audioValues = audioValues, let audioTower = audioTower, let embedAudio = embedAudio, let audioTokenId = config.audioTokenId {
-            let audioOutputs = audioTower(audioValues)
+            let actualAudioMask = audioMask ?? MLXArray.zeros(audioValues.shape[0..<2], dtype: .bool)
+            let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
             let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
-            
-            var audioMaskExpanded = expandedDimensions(inputIds .== audioTokenId, axis: -1)
+
+            let audioTokenMask = inputIds .== audioTokenId
+            var audioMaskExpanded = expandedDimensions(audioTokenMask, axis: -1)
             audioMaskExpanded = broadcast(audioMaskExpanded, to: inputsEmbeds.shape)
             inputsEmbeds = gemma4MaskedScatter(
                 inputTensor: inputsEmbeds,
                 mask: audioMaskExpanded,
                 source: audioFeatures
             )
-            
-            eval(audioFeatures)
-            print("[Gemma4] DEBUG: audioFeatures shape: \\(audioFeatures.shape), padding count: \\(inputIds.asArray(Int.self).filter { $0 == audioTokenId }.count)")
         }
 
         return (inputsEmbeds, perLayerInputs)
@@ -1774,7 +1775,11 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         let convertedCache = cache.map { $0 }
         if input.image?.pixels != nil || input.audio?.features != nil {
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-                inputIds: input.text.tokens, pixelValues: input.image?.pixels, audioValues: input.audio?.features)
+                inputIds: input.text.tokens, 
+                pixelValues: input.image?.pixels, 
+                audioValues: input.audio?.features,
+                audioMask: input.audio?.mask
+            )
             let result = languageModel(
                 nil,
                 cache: convertedCache,
@@ -1796,8 +1801,6 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = languageModel.sanitize(weights: weights)
 
-
-
         if !config.visionConfiguration.useClippedLinears {
             sanitized = sanitized.filter { key, _ in
                 !key.contains("input_min")
@@ -1806,8 +1809,18 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     && !key.contains("output_max")
             }
         }
+        
+        var finalSanitized: [String: MLXArray] = [:]
+        for (key, value) in sanitized {
+            var newKey = key
+            if newKey.contains("subsampling_conv.layers.") {
+                newKey = newKey.replacingOccurrences(of: "subsampling_conv.layers.0", with: "subsample_conv_projection.layer0")
+                newKey = newKey.replacingOccurrences(of: "subsampling_conv.layers.1", with: "subsample_conv_projection.layer1")
+            }
+            finalSanitized[newKey] = value
+        }
 
-        return sanitized
+        return finalSanitized
     }
 }
 
@@ -1854,11 +1867,11 @@ public struct Gemma4Processor: UserInputProcessor {
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+        
+        print("[Omni Debug] Full decoded prompt: \(tokenizer.decode(tokenIds: promptTokens))")
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let imagePlaceholderCount = promptTokens.filter { $0 == config.imageTokenId }.count
-
             let imagePixelsAndFrames = try input.images.map {
                 try preprocess(images: [$0.asCIImage()], processing: input.processing)
             }
@@ -1888,19 +1901,24 @@ public struct Gemma4Processor: UserInputProcessor {
         var processedAudio: LMInput.ProcessedAudio? = nil
         if let audioInput = input.audio.first {
             let samples = try MediaProcessing.extractAudioSamples(from: audioInput)
-            let processor = AudioProcessor(nMels: 128)
-            var melSpec = try processor.generateMelSpectrogram(samples: samples)
+            print("[Omni Debug] Extracted \(samples.count) float samples. Min: \(samples.min() ?? 0.0), Max: \(samples.max() ?? 0.0)")
+            let processor = Gemma4AudioFeatureExtractor(
+                featureSize: 128,
+                samplingRate: 16000,
+                frameLengthMs: 20.0,
+                hopLengthMs: 10.0,
+                melFloor: 1e-3
+            )
+            let (features, mask) = processor.extract(waveform: samples)
+            print("[Omni Debug] Extracted \(features.shape) features. Mean: \(features.mean().item(Float.self)), Min: \(features.min().item(Float.self)), Max: \(features.max().item(Float.self))")
             
-            // AudioProcessor outputs [nMels, validFrames]
-            // Gemma 4 natively injects via [1, validFrames, nMels] sequence structure
-            melSpec = melSpec.transposed().expandedDimensions(axis: 0)
-            let seqLength = melSpec.dim(1)
-            processedAudio = LMInput.ProcessedAudio(features: melSpec, seqLengths: [seqLength])
+            // Expected audio token calc: ceil(audio_duration_ms / 40)
+            let durationMs = Float(samples.count) / 16000.0 * 1000.0
+            var expectedAudioTokens = Int(ceil(durationMs / 40.0))
+            expectedAudioTokens = min(expectedAudioTokens, 750) // audio_seq_length cap
             
-            // Calculate necessary tokens implicitly derived from conformer block strides
-            let layer0Length = (seqLength + 2 * 1 - 1 * (3 - 1) - 1) / 2 + 1
-            let layer1Length = (layer0Length + 2 * 1 - 1 * (3 - 1) - 1) / 2 + 1
-            let expectedAudioTokens = layer1Length
+            let seqLength = features.dim(1)
+            processedAudio = LMInput.ProcessedAudio(features: features, mask: mask, seqLengths: [seqLength])
             
             let audioTokenId = config.audioTokenId ?? 258881
             let gemmaBoa = 256000 // <|audio|>
@@ -1911,13 +1929,16 @@ public struct Gemma4Processor: UserInputProcessor {
             audioPadding.append(gemmaEoa)
             
             let targetIdx = promptTokens.firstIndex(of: gemmaBoa) ?? promptTokens.firstIndex(of: audioTokenId)
+            print("[Omni Debug] Target Index found at: \(String(describing: targetIdx)), gemmaBoa: \(gemmaBoa), audioTokenId: \(audioTokenId)")
             
             var expandedTokens = promptTokens
             expandedTokens.removeAll(where: { $0 == gemmaBoa || $0 == gemmaEoa || $0 == audioTokenId })
             
             if let insertIdx = targetIdx {
+                print("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at \(insertIdx)")
                 expandedTokens.insert(contentsOf: audioPadding, at: insertIdx)
             } else {
+                print("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at 0")
                 expandedTokens.insert(contentsOf: audioPadding, at: 0)
             }
             promptTokens = expandedTokens
