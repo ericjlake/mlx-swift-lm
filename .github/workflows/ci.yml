@@ -49,7 +49,11 @@ jobs:
           /tmp/mlx_venv/bin/pip install --quiet mlx
           # Inject metallib into both build and test runners
           cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib .build/release/
-          find .build -type d -name "MLXLMTests" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/ \;
+          # Ensure it is present in the test bundle resources and alongside the executables
+          find .build/release -type d -name "*.xctest" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/Contents/Resources/ \; 2>/dev/null || true
+          find .build/release -type d -name "*.xctest" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/ \; 2>/dev/null || true
+          # Fallback for search parity
+          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib .
 
       - name: Run Library Tests (Metal Accelerated)
         run: swift test -c release --parallel --skip-build
