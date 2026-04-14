@@ -48,7 +48,7 @@ struct SpeculativeDecodingTests {
     }
 
     @Test(arguments: [2, 8, 48], [false, true])
-    func `Speculative decoding matches default token generation`(
+    func testSpeculativeDecodingMatchesDefaultGeneration(
         numDraftTokens: Int,
         withLogitProcessor: Bool
     ) async throws {
@@ -83,7 +83,7 @@ struct SpeculativeDecodingTests {
     }
 
     @Test
-    func `KV Cache integrity check after draft rejection`() async throws {
+    func testKVCacheIntegrityAfterDraftRejection() async throws {
         // This test specifically verifies that the KVCache is correctly pruned 
         // to the shared history length after a speculative rejection.
         let input = UserInput(prompt: "Analyze the current memory state")
