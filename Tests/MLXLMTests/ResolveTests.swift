@@ -52,7 +52,7 @@ private final class LockIsolated<Value: Sendable>: @unchecked Sendable {
     }
 }
 
-@Suite struct ResolveTests {
+@Suite(.serialized) struct ResolveTests {
 
     @Test func nilTokenizerSourceUsesModelDirectory() async throws {
         let downloader = MockDownloader()

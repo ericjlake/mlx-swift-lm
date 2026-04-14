@@ -59,7 +59,7 @@ jobs:
           find .build -type f -executable -exec cp $MLX_LIB $(dirname "{}")/ \; 2>/dev/null || true
 
       - name: Run Library Tests (Metal Accelerated)
-        run: swift test -c release --parallel --skip-build
+        run: swift test -c release --skip-build
 
       - name: Gemma 4 PLE Stabilization Gate
         run: |
