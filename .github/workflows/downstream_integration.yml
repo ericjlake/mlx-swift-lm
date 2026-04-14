@@ -52,8 +52,14 @@ jobs:
         run: |
           python3 -m venv /tmp/mlx_venv
           /tmp/mlx_venv/bin/pip install --quiet mlx
-          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib SwiftLM/.build/debug/ || echo "No debug metal lib"
-          find SwiftLM/.build -type d -name "MLXLMTests" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/ \;
+          METALLIB=/tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib
+          # Copy to all locations the test runner and linked bundles may search
+          cp $METALLIB SwiftLM/.build/debug/ || true
+          find SwiftLM/.build -name "*.xctest" -exec cp $METALLIB {}/Contents/MacOS/ \; 2>/dev/null || true
+          find SwiftLM/.build -type d \( -name "debug" -o -name "release" \) -exec cp $METALLIB {}/ \; 2>/dev/null || true
+          find SwiftLM/.build/checkouts -type d -name "*.metallib" 2>/dev/null || true
+          # Also copy beside test binaries directly
+          find SwiftLM/.build -name "*Tests" -type f -exec sh -c 'cp '$METALLIB' "$(dirname {})"/' \; 2>/dev/null || true
 
       - name: Run SwiftLM Integration Tests
         run: swift test --parallel --skip-build
