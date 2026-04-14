@@ -6,8 +6,9 @@ import MLXLLM
 import MLXLMCommon
 import Testing
 
-@Suite(.serialized)
-struct SpeculativeDecodingTests {
+extension MLXTestingSuite {
+    @Suite
+    struct SpeculativeDecodingTests {
 
     let processor: any UserInputProcessor
     let mainContext: ModelContext
@@ -117,4 +118,5 @@ struct SpeculativeDecodingTests {
             #expect(c.offset > 0)
         }
     }
+}
 }

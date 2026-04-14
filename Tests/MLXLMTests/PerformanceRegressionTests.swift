@@ -3,8 +3,9 @@ import MLX
 import MLXLMCommon
 import Testing
 
-@Suite("Performance & Resource Regression Tests", .serialized)
-struct PerformanceRegressionTests {
+extension MLXTestingSuite {
+    @Suite("Performance & Resource Regression Tests")
+    struct PerformanceRegressionTests {
     
     /// Helper to measure resident set size (RSS) via Mach task info
     private func getResidentMemory() -> UInt64 {
@@ -66,4 +67,5 @@ struct PerformanceRegressionTests {
         
         #expect(tps >= baselineTokensPerSecond, "Throughput (\(tps) t/s) dropped below the baseline of \(baselineTokensPerSecond) t/s.")
     }
+}
 }

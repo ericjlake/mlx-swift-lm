@@ -3,8 +3,9 @@ import MLX
 import MLXLMCommon
 import Testing
 
-@Suite(.serialized)
-struct KVCacheTests {
+extension MLXTestingSuite {
+    @Suite
+    struct KVCacheTests {
     private static let cacheCreators: [@Sendable () -> any KVCache] = [
         { KVCacheSimple() },
         { RotatingKVCache(maxSize: 32) },
@@ -179,5 +180,6 @@ func testCacheListCopyIsIndependent() async throws {
         #expect(orig.shape == saved.shape)
         #expect(allClose(orig, saved).item(Bool.self))
     }
+}
 }
 }
