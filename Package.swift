@@ -36,7 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/SharpAI/mlx-swift.git", branch: "main"),
+        .package(path: "../mlx-swift"),
 
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],
@@ -65,7 +65,8 @@ let package = Package(
             ],
             path: "Libraries/MLXVLM",
             exclude: [
-                "README.md"
+                "README.md",
+                "Models/test_features.patch"
             ]
         ),
         .target(
