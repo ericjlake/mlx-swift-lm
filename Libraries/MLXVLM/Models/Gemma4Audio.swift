@@ -264,7 +264,7 @@ private class ConformerLightConv1d: Module {
     @ModuleInfo(key: "pre_layer_norm") var preLayerNorm: AudioRMSNorm
     @ModuleInfo(key: "linear_start") var linearStart: ClippedLinear
     @ModuleInfo(key: "depthwise_conv1d") var depthwiseConv1d: Conv1d
-    @ModuleInfo(key: "conv_norm") var convNorm: AudioLayerNorm
+    @ModuleInfo(key: "conv_norm") var convNorm: AudioRMSNorm
     @ModuleInfo(key: "linear_end") var linearEnd: ClippedLinear
     
     let causalPadding: Int
@@ -287,7 +287,7 @@ private class ConformerLightConv1d: Module {
             bias: false
         )
 
-        self._convNorm.wrappedValue = AudioLayerNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._convNorm.wrappedValue = AudioRMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._linearEnd.wrappedValue = ClippedLinear(config.hiddenSize, config.hiddenSize, bias: false)
     }
 
@@ -548,11 +548,13 @@ private class ConformerBlock: Module {
 
     func callAsFunction(_ x: MLXArray, mask: MLXArray, causalValidMask: MLXArray) -> MLXArray {
         var hidden = ffn1(x)
-        
-        let residual = x
-        hidden = MLX.clip(hidden, min: MLXArray(-gradientClipping), max: MLXArray(gradientClipping))
+
+        // Residual taken AFTER ffn1 (matches Python: res = x where x = ffn1(x))
+        let residual = hidden
+        // No extra clip here — Python normalizes raw ffn1 output directly
         let attnIn = normPreAttn(hidden)
-        hidden = hidden + selfAttention(attnIn, mask: mask, causalValidMask: causalValidMask)
+        // Attention base is the normalized input (pre-norm pattern, matches Python)
+        hidden = attnIn + selfAttention(attnIn, mask: mask, causalValidMask: causalValidMask)
         hidden = MLX.clip(hidden, min: MLXArray(-gradientClipping), max: MLXArray(gradientClipping))
         hidden = residual + normPostAttn(hidden)
         
