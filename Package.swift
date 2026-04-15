@@ -36,7 +36,18 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
+        // ── Dependency Update Flow ────────────────────────────────────────────────
+        // ml-explore/mlx-swift  →  SharpAI/mlx-swift (sync bot PR + CI)  →  exact tag below
+        //
+        // SharpAI/mlx-swift adds custom Metal ops NOT in Apple upstream:
+        //   MLXFast.turboDecodeK/V, turboQuantEncode  (TurboKV compression)
+        //   MLXFast.preadInto, prefault               (SSD streaming)
+        // We MUST depend on the SharpAI fork, NOT ml-explore/mlx-swift.
+        //
+        // Local debug: comment the URL line and uncomment:
+        //   .package(path: "../mlx-swift"),
+        // ─────────────────────────────────────────────────────────────────────────
+        .package(url: "https://github.com/SharpAI/mlx-swift.git", exact: "0.30.6"),
 
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],
