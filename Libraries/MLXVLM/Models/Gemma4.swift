@@ -1718,7 +1718,11 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             if let audioValues = audioValues, let audioTower = audioTower, let embedAudio = embedAudio, let audioTokenId = config.audioTokenId {
                 let actualAudioMask = audioMask ?? MLXArray.zeros(audioValues.shape[0..<2], dtype: .bool)
                 let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
+                eval(audioOutputs)
+                print("[Gemma4 Audio-Only] audioOutputs shape=\(audioOutputs.shape) mean=\(audioOutputs.mean().item(Float.self)) max=\(audioOutputs.max().item(Float.self))")
                 let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
+                eval(audioFeatures)
+                print("[Gemma4 Audio-Only] audioFeatures shape=\(audioFeatures.shape) mean=\(audioFeatures.mean().item(Float.self)) max=\(audioFeatures.max().item(Float.self))")
 
                 let audioTokenMask = inputIds .== audioTokenId
                 let audioTokenCount = audioTokenMask.asType(.int32).sum().item(Int.self)
@@ -1727,6 +1731,7 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     print("[Gemma4] Audio token count mismatch: prompt has \(audioTokenCount) audio tokens but tower produced \(audioFeatureCount) feature vectors. Skipping audio injection.")
                     return (inputsEmbeds, perLayerInputs)
                 }
+                print("[Gemma4 Audio-Only] injecting \(audioTokenCount) audio tokens into embeddings")
 
                 var audioMaskExpanded = expandedDimensions(audioTokenMask, axis: -1)
                 audioMaskExpanded = broadcast(audioMaskExpanded, to: inputsEmbeds.shape)
@@ -1762,9 +1767,22 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         if let audioValues = audioValues, let audioTower = audioTower, let embedAudio = embedAudio, let audioTokenId = config.audioTokenId {
             let actualAudioMask = audioMask ?? MLXArray.zeros(audioValues.shape[0..<2], dtype: .bool)
             let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
+            eval(audioOutputs)
+            print("[Gemma4 Omni] audioOutputs shape=\(audioOutputs.shape) mean=\(audioOutputs.mean().item(Float.self)) max=\(audioOutputs.max().item(Float.self))")
             let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
+            eval(audioFeatures)
+            print("[Gemma4 Omni] audioFeatures shape=\(audioFeatures.shape) mean=\(audioFeatures.mean().item(Float.self)) max=\(audioFeatures.max().item(Float.self))")
 
             let audioTokenMask = inputIds .== audioTokenId
+            let audioTokenCount = audioTokenMask.asType(.int32).sum().item(Int.self)
+            let audioFeatureCount = audioFeatures.dim(1)
+            
+            guard audioTokenCount == audioFeatureCount else {
+                print("[Gemma4] Omni Audio token count mismatch: prompt has \(audioTokenCount) audio tokens but tower produced \(audioFeatureCount) feature vectors. Skipping audio injection.")
+                return (inputsEmbeds, perLayerInputs)
+            }
+            print("[Gemma4 Omni] injecting \(audioTokenCount) audio feature vectors → embeddings")
+
             var audioMaskExpanded = expandedDimensions(audioTokenMask, axis: -1)
             audioMaskExpanded = broadcast(audioMaskExpanded, to: inputsEmbeds.shape)
             inputsEmbeds = gemma4MaskedScatter(
@@ -1772,6 +1790,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 mask: audioMaskExpanded,
                 source: audioFeatures
             )
+            eval(inputsEmbeds[0, 0, 0])
+            print("[Gemma4 Omni] post-audio injection embeds[0,0,0]=\(inputsEmbeds[0, 0, 0].item(Float.self))")
         }
 
         return (inputsEmbeds, perLayerInputs)
@@ -1781,7 +1801,14 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
-        if input.image?.pixels != nil || input.audio?.features != nil {
+        let hasImage = input.image?.pixels != nil
+        let hasAudio = input.audio?.features != nil
+        print("[Gemma4 prepare] hasImage=\(hasImage) hasAudio=\(hasAudio) audioTower=\(audioTower != nil) embedAudio=\(embedAudio != nil) audioTokenId=\(String(describing: config.audioTokenId))")
+        if hasImage || hasAudio {
+            print("[Gemma4 prepare] → multimodal path: inputIds.shape=\(input.text.tokens.shape)")
+            if hasAudio {
+                print("[Gemma4 prepare] → audio features shape=\(input.audio!.features.shape)")
+            }
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, 
                 pixelValues: input.image?.pixels, 
@@ -1796,6 +1823,7 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             )
             return .logits(result)
         } else {
+            print("[Gemma4 prepare] → text-only path")
             let result = languageModel(input.text.tokens, cache: convertedCache)
             return .logits(result)
         }
