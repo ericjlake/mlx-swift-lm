@@ -451,11 +451,15 @@ class GLM4MoELiteDecoderLayer: Module {
     }
 }
 
-public class GLM4MoELiteModelInner: Module {
+public class GLM4MoELiteModelInner: Module, LayerPartitionable, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     let layers: [GLM4MoELiteDecoderLayer]
     let norm: RMSNorm
+    
+    public var gpuLayerCount: Int? = nil
+    public var streamExperts: Bool = false
+    public var totalLayerCount: Int { layers.count }
 
     init(_ config: GLM4MoELiteConfiguration) {
         precondition(config.vocabularySize > 0)
@@ -476,7 +480,9 @@ public class GLM4MoELiteModelInner: Module {
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
+                layer(h, mask: mask, cache: cache?[i])
+            }
         }
 
         return norm(h)

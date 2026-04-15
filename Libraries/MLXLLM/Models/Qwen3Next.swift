@@ -29,7 +29,14 @@ final class Qwen3NextRMSNormGated: Module {
     }
 
     func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-        var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+        var x: MLXArray
+        let isCPU = Device.defaultDevice().deviceType == .cpu
+        if isCPU {
+            let variance = mean(square(hiddenStates), axis: -1, keepDims: true)
+            x = (hiddenStates * rsqrt(variance + eps)) * weight
+        } else {
+            x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+        }
         if let gate {
             x = x * silu(gate)
         }

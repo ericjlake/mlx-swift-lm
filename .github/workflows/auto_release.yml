@@ -1,0 +1,39 @@
+name: Auto Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag-and-release:
+    name: Create SemVer Tag and Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Essential for retrieving all tags to calculate the next semver bump
+
+      - name: Calculate release version (b<commit_count>)
+        id: tag_version
+        run: |
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          TAG_NAME="b${COMMIT_COUNT}"
+          echo "Calculated tag: $TAG_NAME"
+          echo "new_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          
+          # Create and push the tag manually
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: "Automated release based on commit count ${{ steps.tag_version.outputs.new_tag }}"
+          generate_release_notes: true

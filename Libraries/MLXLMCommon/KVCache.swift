@@ -313,8 +313,28 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
-    internal var keys: MLXArray?
-    internal var values: MLXArray?
+    public var keys: MLXArray?
+    public var values: MLXArray?
+    
+    // ── TurboQuant State ───────────────────────────────────────────────────────
+    // When turboQuantEnabled=true (--turbo-kv flag), every incoming KV token is
+    // immediately compressed into 3-bit PolarQuant format. No fp16 buffer is kept.
+    // Design mirrors TurboQuantKVCacheV3.update_and_fetch() in the reference:
+    //   all tokens → polarKeys/polarValues packed buffers from token 1.
+    //   AttentionUtils decodes the full packed buffer before each SDPA call.
+    public var turboQuantEnabled: Bool = false
+    /// Tracks head_dim values that have already emitted a TurboKV fallback warning (log once per dim).
+    nonisolated(unsafe) private static var turboWarnedHeadDims: Set<Int> = []
+    /// When true, 512-dim heads were split into 2×256 virtual heads for TurboKV encoding.
+    /// Decode must merge them back: [B, nKVH*2, T, 256] → [B, nKVH, T, 512]
+    public var turboSplitHeads: Bool = false
+    public var polarKeys: MLXArray?    // packed uint8 [B, nKVH, T_total, 68 or 136]
+    public var polarValues: MLXArray?  // packed uint8 [B, nKVH, T_total, 50 or 100]
+    public var residualKeys: MLXArray?
+    public var residualValues: MLXArray?
+    /// Total tokens stored in polarKeys/polarValues
+    public var compressedOffset: Int = 0
+
     public var step = 256
 
     public override init() {
@@ -328,6 +348,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
+        // ── Standard fp16 buffer (always runs — TurboKV evicts cold tokens after writing) ──
         let reset =
             if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
                 true
@@ -348,30 +369,135 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
             if var currentKeys = self.keys, var currentValues = self.values {
                 if previous % step != 0 {
-                    currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
+                    currentKeys  = currentKeys[.ellipsis, ..<previous, 0...]
                     currentValues = currentValues[.ellipsis, ..<previous, 0...]
                 }
-                self.keys = concatenated([currentKeys, newK], axis: 2)
+                self.keys   = concatenated([currentKeys, newK],   axis: 2)
                 self.values = concatenated([currentValues, newV], axis: 2)
             } else {
-                self.keys = newK
+                self.keys   = newK
                 self.values = newV
             }
         }
 
         self.offset += keys.dim(2)
+        self.keys?[.ellipsis,   previous..<self.offset, 0...] = keys
+        self.values?[.ellipsis, previous..<self.offset, 0...] = values
 
-        self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
-        self.values?[.ellipsis, previous ..< self.offset, 0...] = values
+        // ── TurboKV hot-window eviction ───────────────────────────────────────────
+        // Keep the last `turboHotWindowSize` tokens as fp16 (full quality, no decode latency).
+        // Compress everything older into polarKeys in step-sized chunks and evict from fp16.
+        //
+        // Design rationale:
+        //   • Short prompts (< hotWindowSize tokens): zero compression → full fp16 quality ✅
+        //   • Prompt-cache restore: restored fp16 stays in self.keys → not silently lost ✅
+        //   • AttentionUtils: cachedKeys (hot window) and polarKeys (history) are disjoint ✅
+        if turboQuantEnabled {
+            let headDim = keys.dim(-1)
+            let supportedDim = (headDim == 128 || headDim == 256)
+            let splittableDim = (headDim == 512) // split into 2×256 virtual heads
+            if !supportedDim && !splittableDim {
+                if !Self.turboWarnedHeadDims.contains(headDim) {
+                    Self.turboWarnedHeadDims.insert(headDim)
+                    print("[TurboKV] ⚠️  head_dim \(headDim) unsupported (turbo_encode_k requires 128 or 256). Falling back to fp16.")
+                }
+                turboQuantEnabled = false
+            } else if self.offset > turboMinActivationTokens {
+                // Only compress once we have a genuinely long context.
+                // Below this threshold every token stays at full fp16 quality.
+                let coldEnd      = self.offset - turboHotWindowSize
+                let newColdCount = coldEnd - self.compressedOffset  // not-yet-compressed cold tokens
 
-        let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
+                if newColdCount >= step {  // evict in step-sized chunks to avoid micro-operations
+                    if let fullK = self.keys, let fullV = self.values {
+                        var coldK = fullK[.ellipsis, self.compressedOffset..<coldEnd, 0...]
+                        var coldV = fullV[.ellipsis, self.compressedOffset..<coldEnd, 0...]
+
+                        // Split 512-dim heads into 2×256 virtual heads for TurboKV encoding
+                        if headDim == 512 {
+                            turboSplitHeads = true
+                            let B = coldK.dim(0), H = coldK.dim(1), T = coldK.dim(2)
+                            coldK = coldK.reshaped(B, H * 2, T, 256)
+                            coldV = coldV.reshaped(B, H * 2, T, 256)
+                        }
+
+                        let (qK, qV) = MLXFast.turboQuantEncode(keys: coldK, values: coldV, bits: 3)
+
+                        if let existingPK = self.polarKeys, let existingPV = self.polarValues {
+                            self.polarKeys   = concatenated([existingPK, qK.0], axis: 2)
+                            self.polarValues = concatenated([existingPV, qV.0], axis: 2)
+                        } else {
+                            self.polarKeys   = qK.0
+                            self.polarValues = qV.0
+                        }
+                        self.residualKeys   = qK.1
+                        self.residualValues = qV.1
+                        self.compressedOffset += newColdCount
+
+                        // Evict: rebuild fp16 buffer containing only the hot window + one spare step
+                        let hotK = fullK[.ellipsis, coldEnd..<self.offset, 0...]
+                        let hotV = fullV[.ellipsis, coldEnd..<self.offset, 0...]
+                        let sparK = MLXArray.zeros(
+                            [keys.dim(0), keys.dim(1), step, keys.dim(3)], dtype: keys.dtype)
+                        let sparV = MLXArray.zeros(
+                            [values.dim(0), values.dim(1), step, values.dim(3)], dtype: values.dtype)
+                        self.keys   = concatenated([hotK, sparK], axis: 2)
+                        self.values = concatenated([hotV, sparV], axis: 2)
+                        self.offset = turboHotWindowSize  // hot window is now exactly this many tokens
+
+                        TurboKVCacheTelemetry.logOnce(
+                            compressedOffset: newColdCount, keys: qK.0, values: qV.0,
+                            headDim: turboSplitHeads ? 256 : keys.dim(-1))
+                    }
+                }
+            }
+        }
+
+        let returnedKeys   = self.keys![.ellipsis,   ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
-
         return (returnedKeys, returnedValues)
     }
 
+    /// Minimum total token count before TurboKV compression activates.
+    /// Requests shorter than this threshold stay at full fp16 — no compression penalty.
+    /// Tool-use (~800-1500t) and short Q&A (~200-600t) are fully protected.
+    /// Only long-context requests (>2048t) pay the 3-bit compression trade-off.
+    public var turboMinActivationTokens: Int = 2048
+
+    /// Number of fp16 tokens preserved as a high-quality hot window.
+    /// Only tokens older than this boundary are compressed into polarKeys.
+    /// Compression first triggers when offset > turboMinActivationTokens.
+    public var turboHotWindowSize: Int = 256
+
+
+
+
+
     public override var state: [MLXArray] {
         get {
+            // When TurboKV is active the fp16 buffer (self.keys) holds only the hot window.
+            // Returning just that would cause the prompt-cache to lose all compressed history,
+            // making every subsequent request that hits the cache see a truncated context.
+            // Fix: decode polarKeys and concatenate with the hot window to form the full fp16 state.
+            if turboQuantEnabled,
+               let pk = polarKeys, let pv = polarValues,
+               compressedOffset > 0,
+               let hotK = self.keys, let hotV = self.values {
+                var histK = MLXFast.turboDecodeK(packed: pk)
+                var histV = MLXFast.turboDecodeV(packed: pv)
+                // Merge 2×256 virtual heads back to original head count × 512
+                if turboSplitHeads {
+                    let B = histK.dim(0), H2 = histK.dim(1), T = histK.dim(2)
+                    histK = histK.reshaped(B, H2 / 2, T, 512)
+                    histV = histV.reshaped(B, H2 / 2, T, 512)
+                }
+                let hotKSlice = hotK[.ellipsis, ..<offset, 0...]
+                let hotVSlice = hotV[.ellipsis, ..<offset, 0...]
+                return [
+                    concatenated([histK, hotKSlice], axis: 2),
+                    concatenated([histV, hotVSlice], axis: 2),
+                ]
+            }
             guard let keys = self.keys, let values = self.values else { return [] }
             if offset == keys.dim(2) {
                 return [keys, values]
@@ -383,14 +509,29 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             }
         }
         set {
+            if newValue.isEmpty {
+                self.keys = nil
+                self.values = nil
+                self.offset = 0
+                return
+            }
             guard newValue.count == 2 else {
                 fatalError("KVCacheSimple state must have exactly 2 arrays (keys, values)")
             }
+            // Clear TurboKV state on restore — the full fp16 context is now in self.keys.
+            // Compression will resume naturally as new tokens push older ones past the hot window.
+            self.polarKeys = nil
+            self.polarValues = nil
+            self.compressedOffset = 0
+            self.residualKeys = nil
+            self.residualValues = nil
+            self.turboSplitHeads = false
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
         }
     }
+
 
     public override var isTrimmable: Bool { true }
 
@@ -479,7 +620,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return concatenated(toCat, axis: 2)
     }
 
-    private func temporalOrder(_ array: MLXArray) -> MLXArray {
+    public func temporallyOrdered(_ array: MLXArray) -> MLXArray {
         // Rearrange the cache into temporal order, slicing off the end if unused
         if idx == array.dim(2) {
             return array
@@ -501,8 +642,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.values = values
         } else {
             // Put the keys/values in temporal order to preserve context
-            self.keys = temporalOrder(self.keys!)
-            self.values = temporalOrder(self.values!)
+            self.keys = temporallyOrdered(self.keys!)
+            self.values = temporallyOrdered(self.values!)
             idx = self.keys!.dim(2)
 
             // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
@@ -600,6 +741,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             }
         }
         set {
+            if newValue.isEmpty {
+                self.keys = nil
+                self.values = nil
+                return
+            }
             guard newValue.count == 2 else {
                 fatalError("RotatingKVCache state must have exactly 2 arrays")
             }
@@ -649,7 +795,19 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
+        
         idx -= trimmed
+        // Wrap circular buffer correctly, skipping 'keep' region
+        while idx < keep && offset >= keep {
+            // idx underflowed into the keep region (or negative). 
+            // The logical step back from 'keep' is the end of the buffer.
+            idx += (maxCacheSize - keep)
+        }
+        if offset < keep {
+            // If offset itself is within the keep region, idx and offset match.
+            idx = offset
+        }
+
         return trimmed
     }
 
@@ -658,14 +816,25 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         if n > 1 {
-            // Multi-token case
+            // Multi-token case (prefill / prompt re-encode)
+            //
+            // updateConcat temporarily allows the physical key buffer to grow to
+            // (existingKeys + n) before trimming back toward maxCacheSize + n - 1.
+            // The buffer returned to the attention layer has exactly:
+            //   physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
+            // columns, where existingKeys = min(offset, maxCacheSize).
+            //
+            // The mask must be [n, physicalKeyCount] wide, so we pass
+            //   offset = physicalKeyCount - n  to createCausalMask.
             let actualWindowSize = windowSize ?? maxCacheSize
-            let cappedOffset = min(maxCacheSize - 1, offset)
+            let existingKeys = min(offset, maxCacheSize)
+            // Physical key width the cache returns for this n-token batch
+            let physicalKeyCount = min(existingKeys + n, maxCacheSize + n - 1)
+            let maskOffset = physicalKeyCount - n
 
-            // Decide if we need an array mask
-            if cappedOffset + n > actualWindowSize || returnArray {
+            if maskOffset + n > actualWindowSize || returnArray {
                 return .array(
-                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+                    createCausalMask(n: n, offset: maskOffset, windowSize: actualWindowSize))
             }
             return .causal
         } else {
@@ -1133,7 +1302,7 @@ public class ArraysCache: BaseKVCache {
     public func extend(other: ArraysCache) {
         cache = zip(cache, other.cache).map { (c, o) in
             if let c = c, let o = o {
-                return MLX.concatenated([c, o])
+                return MLX.concatenated([c, o], axis: -2)
             }
             return c ?? o
         }
@@ -1211,8 +1380,38 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Saved state for speculative decoding rollback.
+    /// Mamba state is recurrent and cannot be partially "trimmed" like attention KV caches.
+    /// Instead, we checkpoint before speculation and restore on rollback.
+    private var savedState: [MLXArray]?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    /// Mark as trimmable to enable speculative decoding on hybrid Attention+Mamba models.
+    public override var isTrimmable: Bool { true }
+
+    /// Save a checkpoint of the current Mamba state (call before speculative draft round).
+    public func checkpoint() {
+        let s = self.state
+        if !s.isEmpty {
+            savedState = s.map { $0[.ellipsis] }  // deep copy
+        }
+    }
+
+    /// Trim: for Mamba, restore from checkpoint if tokens are rejected.
+    /// When n > 0, rejected draft tokens have polluted the state — restore checkpoint.
+    /// When n == 0, all drafts accepted — keep current state and clear checkpoint.
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        if n > 0, let saved = savedState {
+            self.state = saved
+            savedState = nil
+            return n
+        }
+        savedState = nil  // Clear checkpoint on full acceptance
+        return 0
     }
 
     public override func copy() -> any KVCache {

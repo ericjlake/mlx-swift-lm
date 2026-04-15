@@ -237,4 +237,109 @@ public final class ModelContainer: Sendable {
         let tokenizer = await self.tokenizer
         return try tokenizer.applyChatTemplate(messages: messages)
     }
+
+    // MARK: - Layer Partitioning
+
+    /// Configure GPU/CPU layer partitioning for the loaded model.
+    ///
+    /// When set, the first `gpuLayers` transformer layers run on GPU
+    /// and the rest run on CPU. This enables inference of models larger
+    /// than available GPU memory on Apple Silicon with UMA.
+    ///
+    /// - Parameter gpuLayers: Number of layers to run on GPU, or nil for all-GPU.
+    /// - Returns: The actual number of GPU layers set (after clamping), or nil.
+    @discardableResult
+    public func setGPULayers(_ gpuLayers: Int?) async -> Int? {
+        await context.read { ctx in
+            // Walk the module tree to find a LayerPartitionable child
+            if let partitionable = Self.findPartitionable(in: ctx.model) {
+                partitionable.setGPULayers(gpuLayers)
+                return partitionable.gpuLayerCount
+            }
+            return nil
+        }
+    }
+
+    /// Enable or disable SSD Expert Streaming for MoE models.
+    ///
+    /// When enabled, the model evaluates intermediate states and clears the MLX cache
+    /// layer-by-layer. This allows the OS Page Cache to trivially load active experts
+    /// from SSD and discard them immediately, preventing OOM on memory-constrained devices.
+    ///
+    /// - Parameter stream: Whether expert streaming should be enabled.
+    /// - Returns: True if the model supports streaming and it was set, false otherwise.
+    @discardableResult
+    public func setStreamExperts(_ stream: Bool) async -> Bool {
+        await context.read { ctx in
+            if let streamable = Self.findStreamable(in: ctx.model) {
+                streamable.streamExperts = stream
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Recursively search for a `LayerPartitionable` in the module tree.
+    private static func findPartitionable(in module: Module) -> (any LayerPartitionable)? {
+        // Use MLX's native `modules()` traversal which correctly unwraps @ModuleInfo property wrappers
+        return module.modules().lazy.compactMap { $0 as? (any LayerPartitionable) }.first
+    }
+
+    /// Recursively search for a `StreamableMoE` in the module tree.
+    private static func findStreamable(in module: Module) -> (any StreamableMoE)? {
+        // Use MLX's native `modules()` traversal which correctly unwraps @ModuleInfo property wrappers
+        return module.modules().lazy.compactMap { $0 as? (any StreamableMoE) }.first
+    }
+
+    // MARK: - Speculative Decoding
+
+    /// Extract the raw LanguageModel for use as a draft model in speculative decoding.
+    /// The model weights are immutable after loading, making this safe for cross-context use.
+    public func extractDraftModel() async -> DraftModelRef {
+        await context.read { DraftModelRef(model: $0.model) }
+    }
+
+    /// Generate tokens using speculative decoding with a draft model.
+    ///
+    /// The draft model generates `numDraftTokens` tokens which are then verified in batch
+    /// by the main model. Accepted tokens are emitted; rejected tokens cause KV cache rollback.
+    /// Both models must share the same tokenizer.
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input
+    ///   - parameters: Generation parameters
+    ///   - draftModel: Draft model reference (extracted via `extractDraftModel()`)
+    ///   - numDraftTokens: Number of tokens the draft model proposes per round
+    ///   - wiredMemoryTicket: Optional wired memory ticket
+    /// - Returns: An AsyncStream of generation events (same format as non-speculative)
+    public func generate(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        draftModel: DraftModelRef,
+        numDraftTokens: Int = 4,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<Generation> {
+        let input = SendableBox(input)
+        let draft = draftModel  // Already Sendable via @unchecked
+
+        return try await context.read { context in
+            try MLXLMCommon.generate(
+                input: input.consume(),
+                parameters: parameters,
+                context: context,
+                draftModel: draft.model,
+                numDraftTokens: numDraftTokens,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+}
+
+// MARK: - Speculative Decoding Types
+
+/// Thread-safe wrapper for passing a LanguageModel reference across concurrency boundaries.
+/// Safe when model weights are immutable (post-loading, inference-only usage).
+/// KV caches are created fresh per SpeculativeTokenIterator, so no shared mutable state.
+public struct DraftModelRef: @unchecked Sendable {
+    public let model: any LanguageModel
 }

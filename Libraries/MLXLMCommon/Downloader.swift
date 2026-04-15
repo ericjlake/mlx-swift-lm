@@ -74,6 +74,7 @@ public struct ResolvedModelConfiguration: Sendable {
     public var extraEOSTokens: Set<String>
     public var eosTokenIds: Set<Int>
     public var toolCallFormat: ToolCallFormat?
+    public var lazyLoad: Bool
 
     public init(
         modelDirectory: URL,
@@ -82,7 +83,8 @@ public struct ResolvedModelConfiguration: Sendable {
         defaultPrompt: String,
         extraEOSTokens: Set<String>,
         eosTokenIds: Set<Int>,
-        toolCallFormat: ToolCallFormat?
+        toolCallFormat: ToolCallFormat?,
+        lazyLoad: Bool = false
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -91,6 +93,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.extraEOSTokens = extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.lazyLoad = lazyLoad
     }
 }
 

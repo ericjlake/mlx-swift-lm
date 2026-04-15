@@ -55,7 +55,7 @@ public enum ModelFactoryError: LocalizedError {
 
 /// Context of types that work together to provide a ``LanguageModel``.
 ///
-/// A ``ModelContext`` is created by ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
+/// A ``ModelContext`` is created by ``ModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
 /// This contains the following:
 ///
 /// - ``ModelConfiguration``: identifier for the model
@@ -63,7 +63,7 @@ public enum ModelFactoryError: LocalizedError {
 /// - ``UserInputProcessor``: can convert ``UserInput`` into ``LMInput``
 /// - `Tokenizer` -- the tokenizer used by ``UserInputProcessor``
 ///
-/// See also ``GenericModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)`` and
+/// See also ``ModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)`` and
 /// ``ModelContainer``.
 public struct ModelContext {
     public var configuration: ModelConfiguration
@@ -84,41 +84,23 @@ public struct ModelContext {
 
 /// Protocol for code that can load models.
 ///
-/// See concrete implementations in:
-///
-/// - `LLMModelFactory`
-/// - `VLMModelFactory`
-/// - `EmbedderModelFactory`
-///
-/// or, if loading LLM/VLMs, use the free functions:
-///
-/// - ``loadModel(from:using:configuration:useLatest:progressHandler:)``
-/// - ``loadModelContainer(from:using:configuration:useLatest:progressHandler:)``
-///
-/// or variants.
-public protocol GenericModelFactory<ContextType, ContainerType>: Sendable {
-
-    associatedtype ContextType
-    associatedtype ContainerType: Sendable
+/// ## See Also
+/// - ``loadModel(from:using:id:revision:useLatest:progressHandler:)``
+/// - ``loadModel(from:using:)``
+/// - ``loadModelContainer(from:using:id:revision:useLatest:progressHandler:)``
+/// - ``loadModelContainer(from:using:)``
+public protocol ModelFactory: Sendable {
 
     var modelRegistry: AbstractModelRegistry { get }
 
-    /// load level load of a ``ResolvedModelConfiguration`` (urls) into a
-    /// ``ContextType``.  This is typically `struct` that holds the values
-    /// needed to run inference in the model and is _not_ `Sendable`.
     func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
-    ) async throws -> ContextType
+    ) async throws -> ModelContext
 
-    /// Wrap a ``ContextType`` in a ``ContainerType``.
-    ///
-    /// The `ContainerType` is a `Sendable` container for managing the model contained
-    /// in the `ContextType`.
-    func _wrap(_ context: ContextType) -> ContainerType
 }
 
-extension GenericModelFactory {
+extension ModelFactory {
 
     /// Resolve a model identifier, e.g. "mlx-community/Llama-3.2-3B-Instruct-4bit", into
     /// a ``ModelConfiguration``.
@@ -136,9 +118,10 @@ extension GenericModelFactory {
     public func contains(id: String) -> Bool {
         modelRegistry.contains(id: id)
     }
+
 }
 
-extension GenericModelFactory {
+extension ModelFactory {
 
     /// Load a model from a ``Downloader`` and ``ModelConfiguration``,
     /// producing a ``ModelContext``.
@@ -155,7 +138,7 @@ extension GenericModelFactory {
         configuration: ModelConfiguration,
         useLatest: Bool = false,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
-    ) async throws -> sending ContextType {
+    ) async throws -> sending ModelContext {
         let resolved = try await resolve(
             configuration: configuration, from: downloader,
             useLatest: useLatest, progressHandler: progressHandler)
@@ -170,12 +153,12 @@ extension GenericModelFactory {
         configuration: ModelConfiguration,
         useLatest: Bool = false,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
-    ) async throws -> ContainerType {
+    ) async throws -> ModelContainer {
         let resolved = try await resolve(
             configuration: configuration, from: downloader,
             useLatest: useLatest, progressHandler: progressHandler)
         let context = try await _load(configuration: resolved, tokenizerLoader: tokenizerLoader)
-        return _wrap(context)
+        return ModelContainer(context: context)
     }
 
     /// Load a model from a local directory, producing a ``ModelContext``.
@@ -185,7 +168,7 @@ extension GenericModelFactory {
     public func load(
         from directory: URL,
         using tokenizerLoader: any TokenizerLoader
-    ) async throws -> sending ContextType {
+    ) async throws -> sending ModelContext {
         try await _load(
             configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader)
     }
@@ -194,24 +177,13 @@ extension GenericModelFactory {
     public func loadContainer(
         from directory: URL,
         using tokenizerLoader: any TokenizerLoader
-    ) async throws -> ContainerType {
+    ) async throws -> ModelContainer {
         let context = try await _load(
             configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader)
-        return _wrap(context)
+        return ModelContainer(context: context)
     }
 
 }
-
-extension GenericModelFactory where ContextType == ModelContext, ContainerType == ModelContainer {
-
-    public func _wrap(_ context: ModelContext) -> ModelContainer {
-        .init(context: context)
-    }
-
-}
-
-/// For backward compatibility: `ModelFactory` refers to an LLM/VLM model factory.
-public typealias ModelFactory = GenericModelFactory<ModelContext, ModelContainer>
 
 /// Resolve a ``ModelConfiguration`` into a ``ResolvedModelConfiguration`` by
 /// downloading remote sources via a ``Downloader``.
@@ -254,8 +226,6 @@ public func resolve(
         modelDirectory: modelDirectory,
         tokenizerDirectory: tokenizerDirectory)
 }
-
-// MARK: - LLM Model Loading Free Functions -- implied ModelFactory
 
 /// Load a model given a ``ModelConfiguration``, downloading via a ``Downloader``.
 ///
@@ -403,8 +373,7 @@ public func loadModelContainer(
     }
 }
 
-private func load<R>(loader: (any ModelFactory) async throws -> sending R) async throws -> sending R
-{
+private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
     let factories = ModelFactoryRegistry.shared.modelFactories()
     var lastError: Error?
     for factory in factories {
@@ -450,7 +419,7 @@ private func load<R>(loader: (any ModelFactory) async throws -> sending R) async
 /// ## See Also
 /// - ``ModelFactoryRegistry``
 public protocol ModelFactoryTrampoline {
-    static func modelFactory() -> (any GenericModelFactory<ModelContext, ModelContainer>)?
+    static func modelFactory() -> ModelFactory?
 }
 
 /// Registry of ``ModelFactory`` trampolines.
@@ -472,30 +441,28 @@ final public class ModelFactoryRegistry: @unchecked Sendable {
     public static let shared = ModelFactoryRegistry()
 
     private let lock = NSLock()
-    private var trampolines: [() -> (any ModelFactory)?]
+    private var trampolines: [() -> ModelFactory?]
 
     private init() {
         self.trampolines = [
             {
-                (NSClassFromString("MLXVLM.TrampolineModelFactory")
-                    as? any ModelFactoryTrampoline.Type)?
+                (NSClassFromString("MLXLLM.TrampolineModelFactory") as? ModelFactoryTrampoline.Type)?
                     .modelFactory()
             },
             {
-                (NSClassFromString("MLXLLM.TrampolineModelFactory")
-                    as? any ModelFactoryTrampoline.Type)?
+                (NSClassFromString("MLXVLM.TrampolineModelFactory") as? ModelFactoryTrampoline.Type)?
                     .modelFactory()
             },
         ]
     }
 
-    public func addTrampoline(_ trampoline: @escaping () -> (any ModelFactory)?) {
+    public func addTrampoline(_ trampoline: @escaping () -> ModelFactory?) {
         lock.withLock {
             trampolines.append(trampoline)
         }
     }
 
-    public func modelFactories() -> [any ModelFactory] {
+    public func modelFactories() -> [ModelFactory] {
         lock.withLock {
             trampolines.compactMap { $0() }
         }
