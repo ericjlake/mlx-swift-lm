@@ -128,10 +128,7 @@ public struct EmbedderModelContext {
 ///     progressHandler: logProgress(modelId)
 /// )
 /// ```
-public final class EmbedderModelFactory: GenericModelFactory {
-
-    public typealias ContextType = EmbedderModelContext
-    public typealias ContainerType = EmbedderModelContainer
+public final class EmbedderModelFactory: ModelFactory {
 
     public init(
         typeRegistry: ModelTypeRegistry<EmbeddingModel>,
