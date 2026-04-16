@@ -1072,6 +1072,11 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         for (k, v) in weights {
             let newKey = transformKey(k)
 
+            // Drop layer norm weights if the config says not to use it
+            if !config.projectorUseLayernorm && newKey.hasPrefix("multi_modal_projector.layer_norm") {
+                continue
+            }
+
             // Handle conv weight transposition
             var value = v
             if newKey.contains("conv.weight") {
