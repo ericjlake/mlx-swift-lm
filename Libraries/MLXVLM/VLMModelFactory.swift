@@ -361,7 +361,8 @@ public final class VLMModelFactory: ModelFactory {
         }
 
         var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds.union(configuration.eosTokenIds)
+        eosTokenIds.formUnion(configuration.eosTokenIds)
+        mutableConfiguration.eosTokenIds = eosTokenIds
 
         // Auto-detect tool call format from model type if not explicitly set
         if mutableConfiguration.toolCallFormat == nil {

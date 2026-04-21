@@ -101,7 +101,12 @@ public struct ModelConfiguration: Sendable {
     /// Additional tokens to use for end of string (specified as strings, converted to IDs at runtime)
     public var extraEOSTokens: Set<String>
 
-    /// EOS token IDs loaded from config.json/generation_config.json
+    /// EOS token IDs used during generation.
+    ///
+    /// At load time this set is populated by merging:
+    /// - IDs from the model's `config.json` / `generation_config.json` (loaded at runtime)
+    /// - Any additional IDs provided by the registry / caller at registration time
+    ///   (e.g. `eosTokenIds: [0]` in ``LLMRegistry`` for Gemma-4 pad-token workaround)
     public var eosTokenIds: Set<Int> = []
 
     /// Tool call format for this model (nil = default JSON format)

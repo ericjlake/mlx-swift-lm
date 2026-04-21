@@ -574,7 +574,8 @@ public final class LLMModelFactory: ModelFactory {
 
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds.union(configuration.eosTokenIds)
+        eosTokenIds.formUnion(configuration.eosTokenIds)
+        mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
             mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
                 from: baseConfig.modelType, configData: configData)
