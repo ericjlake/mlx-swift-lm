@@ -48,11 +48,29 @@ public class SwitchGLU: Module, @unchecked Sendable {
     // ── Async pipeline state (SSD streaming optimization) ──
     // Persistent buffers: allocated once per layer, reused across tokens.
     // Avoids per-token buffer allocation + eval overhead.
+    //
+    // Hot Expert LRU cache: we allocate MAX_CACHE_SLOTS (>= top_k) buffers
+    // per layer and keep experts resident across tokens. On each token we
+    // only need to pread the misses — experts that aren't already cached.
+    // `_slotExpert[s]` tracks which expert currently occupies slot s (nil =
+    // empty). `_slotLastUsed[s]` holds the token counter at last hit/fill,
+    // used for LRU eviction when all slots are full and a new expert misses.
+    //
+    // Memory cost scales linearly: 8 slots ≈ 5GB across 48 layers for the
+    // 122B model; 16 slots ≈ 10GB. We cap below the ~13GB that was shown to
+    // over-pressure the allocator in the earlier in-memory-cache experiment.
+    static let MAX_CACHE_SLOTS: Int = 16
+
     private var _persistentGate: [MLXArray]?
     private var _persistentUp: [MLXArray]?
     private var _persistentDown: [MLXArray]?
-    // Previous token's expert routing per layer for speculative prefetch.
+    // Per-slot expert occupant and last-used token counter.
+    private var _slotExpert: [Int?]?
+    private var _slotLastUsed: [Int]?
+    // Previous token's expert routing for speculative prefetch.
     private var _previousExpertIds: [Int]?
+    // Per-layer token counter. Incremented each fast-path call; used by LRU.
+    private var _tokenCounter: Int = 0
 
     public init(
         inputDims: Int,
@@ -121,28 +139,44 @@ public class SwitchGLU: Module, @unchecked Sendable {
             if idx.size <= 32 {
                 // ── FAST PATH: single-token generation with async I/O-GPU pipeline ──
                 //
-                // STRATEGY: Overlap NVMe I/O with GPU compute using asyncEval.
+                // STRATEGY: Overlap NVMe I/O with GPU compute using asyncEval,
+                // plus a Hot Expert LRU cache that keeps recently-used experts
+                // resident across tokens.
                 //
-                // Cold path (first token): Allocate persistent buffers, merged eval,
-                //   full pread — same as ssd-opt-v1 baseline.
+                // Cold path (first token): Allocate MAX_CACHE_SLOTS persistent
+                //   buffers per projection. Merged eval, full pread for the
+                //   top-k experts, record them in slots 0..topk-1.
                 //
-                // Warm path (subsequent tokens): asyncEval(idx) starts GPU work
-                //   (prev layer expert compute + current attention/router) while
-                //   CPU speculatively preads predicted experts (from previous token's
-                //   routing) into persistent buffers. After GPU sync, only ~30% of
-                //   experts need on-demand pread (misses). Saves ~60ms/token by
-                //   hiding I/O behind GPU compute.
+                // Warm path (subsequent tokens):
+                //   1. asyncEval(idx) kicks off GPU work (prev-layer experts,
+                //      current attention + router). ~2.7 ms.
+                //   2. Speculative pread during the GPU window: for each expert
+                //      in `_previousExpertIds` that is NOT already cached, evict
+                //      an LRU slot and issue a pread. Cached-and-already-hot
+                //      experts are not re-read (free — they were already loaded).
+                //   3. After GPU sync, resolve the actual routing. Hits use the
+                //      cached slot with zero I/O. Misses evict the next LRU slot
+                //      and pread on demand (critical path).
                 //
-                // Memory cost: ~5GB for persistent buffers across 48 layers
-                //   (vs ~13GB for the failed in-memory cache approach).
+                // Expected effect: because top_k=8 and the cache holds 16 slots,
+                // hot experts that repeat across 2–3 tokens stay resident and
+                // never hit the SSD a second time. Miss rate drops from ~30% to
+                // ~5-15% on prose workloads.
+                //
+                // Memory cost: ~5GB (8 slots) → ~10GB (16 slots) across 48 layers
+                // for the 122B model. Below the ~13GB ceiling that previously
+                // over-pressured the allocator.
 
-                let maxBuffers = idx.size  // typically 8 (top_k)
+                let CACHE_SLOTS = SwitchGLU.MAX_CACHE_SLOTS
 
                 if _persistentGate == nil {
                     // ── COLD PATH: first token, allocate persistent buffers ──
-                    _persistentGate = qGate.allocateExpertBuffers(maxBuffers)
-                    _persistentUp = qUp.allocateExpertBuffers(maxBuffers)
-                    _persistentDown = qDown.allocateExpertBuffers(maxBuffers)
+                    _persistentGate = qGate.allocateExpertBuffers(CACHE_SLOTS)
+                    _persistentUp = qUp.allocateExpertBuffers(CACHE_SLOTS)
+                    _persistentDown = qDown.allocateExpertBuffers(CACHE_SLOTS)
+                    _slotExpert = Array(repeating: nil, count: CACHE_SLOTS)
+                    _slotLastUsed = Array(repeating: 0, count: CACHE_SLOTS)
+                    _tokenCounter = 0
 
                     // Merged eval: idx + buffer allocations (same as ssd-opt-v1)
                     var toEval: [MLXArray] = [idx]
@@ -174,7 +208,9 @@ public class SwitchGLU: Module, @unchecked Sendable {
                         startIdx = endIdx
                     }
 
-                    // Full concurrent pread (baseline path)
+                    _tokenCounter += 1
+
+                    // Full concurrent pread — slot mapping is 1:1 with ranges.
                     let totalReads = ranges.count * 3
                     DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                         let expertIdx = i / 3
@@ -193,47 +229,92 @@ public class SwitchGLU: Module, @unchecked Sendable {
                         }
                     }
 
+                    // Record slot occupancy + LRU timestamps.
+                    for (i, r) in ranges.enumerated() {
+                        _slotExpert![i] = r.id
+                        _slotLastUsed![i] = _tokenCounter
+                    }
+
                     // Store routing for next token's predictions
                     _previousExpertIds = ranges.map { $0.id }
 
-                    // Lazy compute
-                    let usedGate = Array(_persistentGate![0..<ranges.count])
-                    let usedUp = Array(_persistentUp![0..<ranges.count])
-                    let usedDown = Array(_persistentDown![0..<ranges.count])
+                    // Lazy compute — use slots 0..ranges.count-1
+                    let usedGate = Array(_persistentGate!.prefix(ranges.count))
+                    let usedUp = Array(_persistentUp!.prefix(ranges.count))
+                    let usedDown = Array(_persistentDown!.prefix(ranges.count))
                     let xGate = qGate.computeExperts(x, buffers: usedGate, ranges: ranges)
                     let xUp = qUp.computeExperts(x, buffers: usedUp, ranges: ranges)
                     let intermediate = activation(xGate) * xUp
                     x = qDown.computeExperts(intermediate, buffers: usedDown, ranges: ranges)
 
                 } else {
-                    // ── WARM PATH: asyncEval + speculative pread pipeline ──
+                    // ── WARM PATH: asyncEval + LRU-aware speculative pread ──
+
+                    _tokenCounter += 1
 
                     // Start GPU work asynchronously: forces prev layer's expert
                     // compute + current layer's attention + router.
-                    // GPU time: ~2.7ms. CPU is free immediately.
                     asyncEval(idx)
 
-                    // Speculative pread during GPU async window.
-                    // Load previous token's experts into persistent buffers.
-                    // ~70% will match this token's routing (expert stickiness).
-                    // The 1.7ms of pread overlaps with 2.7ms of GPU work.
+                    // Build the current slot→expert occupancy map.
+                    var expertToSlot = [Int: Int]()
+                    for (slot, eid) in _slotExpert!.enumerated() {
+                        if let eid = eid { expertToSlot[eid] = slot }
+                    }
+
+                    // Helper: pick the slot to evict for a miss.
+                    // Skips slots we've already claimed for THIS token.
+                    func pickEvictionSlot(excluding claimed: Set<Int>) -> Int {
+                        // Prefer empty slots.
+                        for s in 0..<CACHE_SLOTS {
+                            if claimed.contains(s) { continue }
+                            if _slotExpert![s] == nil { return s }
+                        }
+                        // Else pick the least-recently-used unclaimed slot.
+                        var bestSlot = -1
+                        var bestTs = Int.max
+                        for s in 0..<CACHE_SLOTS {
+                            if claimed.contains(s) { continue }
+                            if _slotLastUsed![s] < bestTs {
+                                bestTs = _slotLastUsed![s]
+                                bestSlot = s
+                            }
+                        }
+                        return bestSlot
+                    }
+
+                    // ── Speculative pread: load prev-token's experts that are
+                    //    NOT already cached. Cached hot experts cost us nothing.
+                    var specTargets = [(expertId: Int, slot: Int)]()
                     if let prevIds = _previousExpertIds {
-                        let specCount = min(prevIds.count, maxBuffers)
-                        let specReads = specCount * 3
-                        DispatchQueue.concurrentPerform(iterations: specReads) { i in
-                            let slot = i / 3
+                        var specClaimed = Set<Int>()  // slots used by this speculation
+                        for eid in prevIds {
+                            if expertToSlot[eid] != nil { continue }  // already cached — skip
+                            let slot = pickEvictionSlot(excluding: specClaimed)
+                            if slot < 0 { break }  // all slots claimed (shouldn't happen — CACHE_SLOTS > top_k)
+                            if let old = _slotExpert![slot] { expertToSlot.removeValue(forKey: old) }
+                            _slotExpert![slot] = eid
+                            expertToSlot[eid] = slot
+                            specClaimed.insert(slot)
+                            specTargets.append((eid, slot))
+                        }
+                    }
+                    if !specTargets.isEmpty {
+                        let specReads = specTargets.count * 3
+                        DispatchQueue.concurrentPerform(iterations: specReads) { [specTargets] i in
+                            let tIdx = i / 3
                             let proj = i % 3
-                            let expertId = prevIds[slot]
+                            let t = specTargets[tIdx]
                             switch proj {
                             case 0:
-                                MLXFast.preadInto(self._persistentGate![slot], safetensorsPath: gateSSD.path,
-                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(expertId))
+                                MLXFast.preadInto(self._persistentGate![t.slot], safetensorsPath: gateSSD.path,
+                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(t.expertId))
                             case 1:
-                                MLXFast.preadInto(self._persistentUp![slot], safetensorsPath: upSSD.path,
-                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(expertId))
+                                MLXFast.preadInto(self._persistentUp![t.slot], safetensorsPath: upSSD.path,
+                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(t.expertId))
                             default:
-                                MLXFast.preadInto(self._persistentDown![slot], safetensorsPath: downSSD.path,
-                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(expertId))
+                                MLXFast.preadInto(self._persistentDown![t.slot], safetensorsPath: downSSD.path,
+                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(t.expertId))
                             }
                         }
                     }
@@ -262,88 +343,57 @@ public class SwitchGLU: Module, @unchecked Sendable {
                     }
                     let actualIds = ranges.map { $0.id }
 
-                    // Map actual experts to persistent buffer slots.
-                    // Hits: buffer slot already has correct data from speculative pread.
-                    // Misses: assign to a free slot, pread on demand.
+                    // ── Resolve hits/misses against the cache. ──
                     var usedGate = [MLXArray]()
                     var usedUp = [MLXArray]()
                     var usedDown = [MLXArray]()
+                    var claimedSlots = Set<Int>()
+                    var missInfo = [(expertId: Int, slot: Int)]()
 
-                    if let prevIds = _previousExpertIds {
-                        var prevSlotMap = [Int: Int]()  // expertId -> buffer slot
-                        for (slot, eid) in prevIds.enumerated() {
-                            prevSlotMap[eid] = slot
-                        }
-
-                        var usedSlots = Set<Int>()
-                        var missInfo = [(rangeIdx: Int, expertId: Int, bufferSlot: Int)]()
-
-                        for (ri, r) in ranges.enumerated() {
-                            if let slot = prevSlotMap[r.id], !usedSlots.contains(slot) {
-                                // HIT: persistent buffer[slot] has correct expert data
-                                usedGate.append(_persistentGate![slot])
-                                usedUp.append(_persistentUp![slot])
-                                usedDown.append(_persistentDown![slot])
-                                usedSlots.insert(slot)
-                            } else {
-                                // MISS: find a free slot
-                                let freeSlot = (0..<maxBuffers).first { !usedSlots.contains($0) }!
-                                usedGate.append(_persistentGate![freeSlot])
-                                usedUp.append(_persistentUp![freeSlot])
-                                usedDown.append(_persistentDown![freeSlot])
-                                usedSlots.insert(freeSlot)
-                                missInfo.append((ri, r.id, freeSlot))
+                    for r in ranges {
+                        if let slot = expertToSlot[r.id], !claimedSlots.contains(slot) {
+                            // HIT
+                            usedGate.append(_persistentGate![slot])
+                            usedUp.append(_persistentUp![slot])
+                            usedDown.append(_persistentDown![slot])
+                            claimedSlots.insert(slot)
+                            _slotLastUsed![slot] = _tokenCounter
+                        } else {
+                            // MISS — evict LRU slot (not already claimed this token)
+                            let slot = pickEvictionSlot(excluding: claimedSlots)
+                            if slot < 0 {
+                                // Should not happen; CACHE_SLOTS >= top_k.
+                                fatalError("SwitchGLU cache: no slot available for expert \(r.id)")
                             }
+                            if let old = _slotExpert![slot] { expertToSlot.removeValue(forKey: old) }
+                            _slotExpert![slot] = r.id
+                            expertToSlot[r.id] = slot
+                            _slotLastUsed![slot] = _tokenCounter
+                            claimedSlots.insert(slot)
+                            usedGate.append(_persistentGate![slot])
+                            usedUp.append(_persistentUp![slot])
+                            usedDown.append(_persistentDown![slot])
+                            missInfo.append((r.id, slot))
                         }
+                    }
 
-                        // Pread only misses (~30% of experts, ~6 reads at QD=6)
-                        if !missInfo.isEmpty {
-                            let totalMissReads = missInfo.count * 3
-                            DispatchQueue.concurrentPerform(iterations: totalMissReads) { [missInfo] i in
-                                let mIdx = i / 3
-                                let proj = i % 3
-                                let info = missInfo[mIdx]
-                                switch proj {
-                                case 0:
-                                    MLXFast.preadInto(self._persistentGate![info.bufferSlot],
-                                                      safetensorsPath: gateSSD.path,
-                                                      tensorName: gateSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
-                                case 1:
-                                    MLXFast.preadInto(self._persistentUp![info.bufferSlot],
-                                                      safetensorsPath: upSSD.path,
-                                                      tensorName: upSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
-                                default:
-                                    MLXFast.preadInto(self._persistentDown![info.bufferSlot],
-                                                      safetensorsPath: downSSD.path,
-                                                      tensorName: downSSD.tensorName,
-                                                      expertIndex: UInt32(info.expertId))
-                                }
-                            }
-                        }
-                    } else {
-                        // No predictions available — full pread fallback
-                        for i in 0..<ranges.count {
-                            usedGate.append(_persistentGate![i])
-                            usedUp.append(_persistentUp![i])
-                            usedDown.append(_persistentDown![i])
-                        }
-                        let totalReads = ranges.count * 3
-                        DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
-                            let expertIdx = i / 3
-                            let projIdx = i % 3
-                            let r = ranges[expertIdx]
-                            switch projIdx {
+                    // Pread only misses.
+                    if !missInfo.isEmpty {
+                        let totalMissReads = missInfo.count * 3
+                        DispatchQueue.concurrentPerform(iterations: totalMissReads) { [missInfo] i in
+                            let mIdx = i / 3
+                            let proj = i % 3
+                            let info = missInfo[mIdx]
+                            switch proj {
                             case 0:
-                                MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: gateSSD.path,
-                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(r.id))
+                                MLXFast.preadInto(self._persistentGate![info.slot], safetensorsPath: gateSSD.path,
+                                                  tensorName: gateSSD.tensorName, expertIndex: UInt32(info.expertId))
                             case 1:
-                                MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: upSSD.path,
-                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(r.id))
+                                MLXFast.preadInto(self._persistentUp![info.slot], safetensorsPath: upSSD.path,
+                                                  tensorName: upSSD.tensorName, expertIndex: UInt32(info.expertId))
                             default:
-                                MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: downSSD.path,
-                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(r.id))
+                                MLXFast.preadInto(self._persistentDown![info.slot], safetensorsPath: downSSD.path,
+                                                  tensorName: downSSD.tensorName, expertIndex: UInt32(info.expertId))
                             }
                         }
                     }
