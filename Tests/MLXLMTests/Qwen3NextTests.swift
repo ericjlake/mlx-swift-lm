@@ -41,8 +41,7 @@ extension MLXTestingSuite {
 
         @Test("Qwen3Next callCapturing returns captured layers")
         func testQwen3NextCallCapturing() throws {
-            Device.setDefault(device: Device.cpu)
-            
+
             let data = makeTinyConfigData()
             let config = try JSONDecoder().decode(Qwen3NextConfiguration.self, from: data)
             let model = Qwen3NextModel(config)

@@ -14,7 +14,7 @@ extension MLXTestingSuite {
             {
                 "model_type": "qwen3_5",
                 "hidden_size": 64,
-                "num_hidden_layers": 2,
+                "num_hidden_layers": 4,
                 "intermediate_size": 128,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
@@ -29,8 +29,7 @@ extension MLXTestingSuite {
 
         @Test("Qwen35 callCapturing returns captured layers")
         func testQwen35CallCapturing() throws {
-            Device.setDefault(device: Device.cpu)
-            
+
             let data = makeTinyConfigData()
             let config = try JSONDecoder().decode(Qwen35Configuration.self, from: data)
             let model = Qwen35Model(config)
