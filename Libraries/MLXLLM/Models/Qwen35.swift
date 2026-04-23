@@ -574,7 +574,7 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
     let norm: MathRMSNorm
@@ -613,7 +613,7 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
-        if cacheArray == nil {
+        if cacheArray == nil || cacheArray?.count != layers.count {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
@@ -633,6 +633,37 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
 
         return norm(hiddenStates)
     }
+
+    public func callCapturing(_ inputs: MLXArray, cache: [KVCache?]? = nil, captureLayerIDs: Set<Int>) -> (MLXArray, [Int: MLXArray]) {
+        var hiddenStates = embedTokens(inputs)
+
+        var cacheArray = cache
+        if cacheArray == nil || cacheArray?.count != layers.count {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+
+        var captured = [Int: MLXArray]()
+
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            hiddenStates = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts, cacheToEval: cacheArray?[i]) {
+                layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            }
+            
+            if captureLayerIDs.contains(i) {
+                captured[i] = hiddenStates
+            }
+        }
+
+        return (norm(hiddenStates), captured)
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -642,7 +673,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
 
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear?
 
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
@@ -725,7 +756,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
