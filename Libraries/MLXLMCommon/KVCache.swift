@@ -1251,7 +1251,7 @@ public class ChunkedKVCache: KVCacheSimple {
 }
 
 /// Base cache for array-based state storage
-public class ArraysCache: BaseKVCache {
+open class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
 
@@ -1265,12 +1265,12 @@ public class ArraysCache: BaseKVCache {
         cache.compactMap { $0 }
     }
 
-    public subscript(index: Int) -> MLXArray? {
+    open subscript(index: Int) -> MLXArray? {
         get { cache[index] }
         set { cache[index] = newValue }
     }
 
-    public override var state: [MLXArray] {
+    open override var state: [MLXArray] {
         get {
             return cache.compactMap { $0 }
         }
@@ -1279,7 +1279,7 @@ public class ArraysCache: BaseKVCache {
         }
     }
 
-    public override func copy() -> any KVCache {
+    open override func copy() -> any KVCache {
         let new = ArraysCache(size: cache.count)
         let s = self.state
         if !s.isEmpty {
@@ -1322,7 +1322,7 @@ public class ArraysCache: BaseKVCache {
 
     /// metaState format: [slotCount, presentSlots (comma-separated), leftPadding (comma-separated, optional)]
     /// Legacy format (BaseKVCache default): [""]
-    public override var metaState: [String] {
+    open override var metaState: [String] {
         get {
             var result = [
                 "\(cache.count)",
@@ -1379,7 +1379,7 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
-public class MambaCache: ArraysCache {
+open class MambaCache: ArraysCache {
     /// Saved state for speculative decoding rollback.
     /// Mamba state is recurrent and cannot be partially "trimmed" like attention KV caches.
     /// Instead, we checkpoint before speculation and restore on rollback.
@@ -1390,10 +1390,10 @@ public class MambaCache: ArraysCache {
     }
 
     /// Mark as trimmable to enable speculative decoding on hybrid Attention+Mamba models.
-    public override var isTrimmable: Bool { true }
+    open override var isTrimmable: Bool { true }
 
     /// Save a checkpoint of the current Mamba state (call before speculative draft round).
-    public func checkpoint() {
+    open func checkpoint() {
         let s = self.state
         if !s.isEmpty {
             savedState = s.map { $0[.ellipsis] }  // deep copy
@@ -1404,7 +1404,7 @@ public class MambaCache: ArraysCache {
     /// When n > 0, rejected draft tokens have polluted the state — restore checkpoint.
     /// When n == 0, all drafts accepted — keep current state and clear checkpoint.
     @discardableResult
-    public override func trim(_ n: Int) -> Int {
+    open override func trim(_ n: Int) -> Int {
         if n > 0, let saved = savedState {
             self.state = saved
             savedState = nil
@@ -1414,7 +1414,7 @@ public class MambaCache: ArraysCache {
         return 0
     }
 
-    public override func copy() -> any KVCache {
+    open override func copy() -> any KVCache {
         let new = MambaCache()
         let s = self.state
         if !s.isEmpty {
