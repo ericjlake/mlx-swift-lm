@@ -90,9 +90,11 @@ public struct DeepseekV4Configuration: Codable, Sendable {
 
 // MARK: - Helper Functions
 
-/// sqrtsoftplus activation used for V4 MoE routing: sqrt(softplus(x)) = sqrt(log(1 + e^x))
+/// sqrtsoftplus activation: sqrt(softplus(x)) = sqrt(log(1 + e^x))
+/// Uses numerically stable form to avoid exp overflow for large positive x.
 private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
-    MLX.sqrt(MLX.log1p(MLX.exp(x)))
+    let sp = MLX.maximum(x, MLXArray(0)) + MLX.log1p(MLX.exp(-MLX.abs(x)))
+    return MLX.sqrt(sp)
 }
 
 /// Apply per-head RMS normalization (without learnable scale)
@@ -239,6 +241,39 @@ private func hcHead(
 
 // MARK: - Attention
 
+/// Attention with cache update that optionally applies per-head sink bias.
+/// Mirrors `attentionWithCacheUpdateAndSinks` from MiMoV2Flash but uses the public API.
+private func deepseekAttentionWithSinks(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    cache: KVCache?,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?
+) -> MLXArray {
+    guard let cache else {
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask, sinks: sinks)
+    }
+    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+        precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
+        let (qk, qv) = quantizedKVCache.updateQuantized(keys: keys, values: values)
+        return quantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: qk, quantizedValues: qv,
+            scale: scale, mask: mask,
+            groupSize: quantizedKVCache.groupSize,
+            bits: quantizedKVCache.bits,
+            mode: quantizedKVCache.mode)
+    }
+    let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+    return MLXFast.scaledDotProductAttention(
+        queries: queries, keys: cachedKeys, values: cachedValues,
+        scale: scale, mask: mask, sinks: sinks)
+}
+
 class DeepseekV4Attention: Module {
     let config: DeepseekV4Configuration
     let numHeads: Int
@@ -293,12 +328,12 @@ class DeepseekV4Attention: Module {
 
         // Grouped output projection
         // wo_a: Linear(nHeadsPerGroup * headDim, oGroups * oLoraRank) per group → stored as [oGroups*oLoraRank, nHeadsPerGroup*headDim]
-        let nHeadsPerGroup = config.numAttentionHeads / config.oGroups
         self._woA.wrappedValue = Linear(nHeadsPerGroup * config.headDim, config.oGroups * config.oLoraRank, bias: false)
         self._woB.wrappedValue = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
 
-        // Attention sink: shape [qkRopeHeadDim], initialized to zeros, overwritten by weight loading
-        self.attn_sink = zeros([config.qkRopeHeadDim])
+        // Attention sink: per-head bias [numAttentionHeads], applied to attention logits before softmax.
+        // Shape matches numAttentionHeads (== qkRopeHeadDim in this architecture).
+        self.attn_sink = zeros([config.numAttentionHeads])
 
         // RoPE using compress_rope_theta (used for most layers with compress_ratio != 0)
         // We use a single rope config as a simplification
@@ -354,14 +389,20 @@ class DeepseekV4Attention: Module {
             }
             return concatenated(pieces, axis: -1)  // [B, L, oGroups * oLoraRank]
         } else {
-            // Non-quantized fallback: batch matmul
-            // weight [oGroups*oLoraRank, groupFeat] → [oGroups, oLoraRank, groupFeat]
-            let wa = woA.weight.reshaped(oGroups, oLoraRank, groupFeat)
-            // grouped: [B, L, oGroups, groupFeat]
-            let grouped = outFlat.reshaped(B, L, oGroups, groupFeat)
-            // matmul: [B, L, oGroups, groupFeat] @ [oGroups, groupFeat, oLoraRank] → [B, L, oGroups, oLoraRank]
-            let oLora = matmul(grouped, wa.transposed(0, 2, 1))
-            return oLora.reshaped(B, L, oGroups * oLoraRank)
+            // Non-quantized fallback: per-group matmul (same structure as quantized path).
+            // A single batched matmul would broadcast batch dims [B,L] against [oGroups],
+            // which fails when L != oGroups, so we loop instead.
+            var pieces: [MLXArray] = []
+            for g in 0 ..< oGroups {
+                let gStart = g * groupFeat
+                let gEnd   = (g + 1) * groupFeat
+                let rStart = g * oLoraRank
+                let rEnd   = (g + 1) * oLoraRank
+                let groupInput = outFlat[0..., 0..., gStart ..< gEnd]  // [B, L, groupFeat]
+                let wa_g = woA.weight[rStart ..< rEnd]                 // [oLoraRank, groupFeat]
+                pieces.append(matmul(groupInput, wa_g.T))              // [B, L, oLoraRank]
+            }
+            return concatenated(pieces, axis: -1)
         }
     }
 
@@ -401,13 +442,16 @@ class DeepseekV4Attention: Module {
 
         // --- Attention ---
         // Pass kFull as both keys and values; cache update happens inside.
-        let output = attentionWithCacheUpdate(
+        // Apply attn_sink (per-head bias) to attention logits when non-zero.
+        let sinksToUse: MLXArray? = attn_sink.sum().item(Float.self) != 0 ? attn_sink : nil
+        let output = deepseekAttentionWithSinks(
             queries: queries,
             keys: kFull,
             values: kFull,
             cache: cache,
             scale: scale,
-            mask: mask
+            mask: mask,
+            sinks: sinksToUse
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, numHeads, headDim)               // [B, L, n_heads, head_dim]
@@ -483,8 +527,6 @@ class DeepseekV4Gate: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let (bsz, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
-
         // Compute expert scores
         let logits = x.matmul(weight.T)       // [B, S, n_experts]
         var scores: MLXArray
@@ -778,7 +820,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     let firstKey = "\(prefix).ffn.experts.0.\(projName).\(key)"
                     if weights[firstKey] != nil {
                         let stacked = (0 ..< args.nRoutedExperts).map {
-                            weights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]!
+                            // Prefer dequantized value from newWeights (FP8 dequant), fall back to original
+                            newWeights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]
+                                ?? weights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]!
                         }
                         newWeights["\(prefix).ffn.switch_mlp.\(projName).\(key)"] = MLX.stacked(stacked)
                         for j in 0 ..< args.nRoutedExperts {
