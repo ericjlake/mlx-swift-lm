@@ -78,7 +78,6 @@ public class DeepseekV4Tests: XCTestCase {
         XCTAssertEqual(model.model.layers.count, expectedLayers,
                        "Layer count should exclude MTP layers")
 
-        let B = 1, S = 4
         let input = MLXArray([0, 1, 2, 3])[.newAxis, .ellipsis]  // [1, 4]
         let output = model(input, cache: nil)
 
@@ -235,7 +234,6 @@ public class DeepseekV4Tests: XCTestCase {
         let config = makeSmallConfig()
         let model = DeepseekV4Model(config)
 
-        let tokens = [42, 100, 7]
         let tokenArray = MLXArray([42, 100, 7])[.newAxis, .ellipsis]  // [1, 3]
 
         let out1 = model(tokenArray, cache: nil)
