@@ -302,9 +302,20 @@ public class DeepseekV4Tests: XCTestCase {
         let modelPath = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent("models/deepseek-v4-flash")
 
+        // Set memory limits immediately — model is 126 GB on 64 GB RAM, must configure
+        // before any weight loading so MLX uses mmap-backed paging, not eager RAM loading.
+        Memory.memoryLimit = 200 * 1024 * 1024 * 1024  // 200 GB sentinel (bypass spin-wait loop)
+        Memory.cacheLimit = 50 * 1024 * 1024 * 1024    // 50 GB page-cache budget
+
+        // Write debug info immediately so we can see if test even starts
+        try? "START home=\(NSHomeDirectory()) modelPath=\(modelPath.path)".write(
+            toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
+
         // Check that enough shards are present (at least shard 1)
         let shard1 = modelPath.appendingPathComponent("model-00001-of-00028.safetensors")
-        guard FileManager.default.fileExists(atPath: shard1.path) else {
+        let shard1Exists = FileManager.default.fileExists(atPath: shard1.path)
+        try? "STAGE:shard1=\(shard1Exists) path=\(shard1.path)".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
+        guard shard1Exists else {
             throw XCTSkip("Model shards not yet downloaded; skipping inference test")
         }
 
@@ -317,6 +328,7 @@ public class DeepseekV4Tests: XCTestCase {
                 missingShards.append(i)
             }
         }
+        try? "STAGE:shardCheck missing=\(missingShards)".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
         guard missingShards.isEmpty else {
             throw XCTSkip("Missing shards \(missingShards); download not complete")
         }
@@ -324,23 +336,47 @@ public class DeepseekV4Tests: XCTestCase {
         // Load config
         let configPath = modelPath.appendingPathComponent("config.json")
         let configData = try Data(contentsOf: configPath)
+        try? "STAGE:configRead".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
         let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: configData)
+        try? "STAGE:configDecoded vocab=\(config.vocabSize)".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
         // Read base config for per-layer quantization
         let baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
 
         // Create model and load weights with per-layer quantization
         let model = DeepseekV4Model(config)
-        try loadWeights(
-            modelDirectory: modelPath,
-            model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+        try? "STAGE:modelCreated".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
+
+        do {
+            // lazyLoad: true skips the final eval(model) in loadWeights — critical for
+            // 126 GB models on 64 GB RAM. Without it, loadWeights calls eval(model)
+            // which materialises all weights into RAM at once → OOM SIGKILL.
+            // With lazyLoad: true, MLX mmaps weights and pages them in on demand via SSD.
+            // Activate ExpertStreamingConfig so MoE layer forward passes use the
+            // SSD streaming path rather than demanding all expert weights up front.
+            ExpertStreamingConfig.shared.activate(modelDirectory: modelPath, useDirectIO: true)
+            try loadWeights(
+                modelDirectory: modelPath,
+                model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                lazyLoad: true)
+            try? "STAGE:weightsLoaded".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
+        } catch {
+            let msg = "STAGE:loadWeightsFailed error=\(error)"
+            try? msg.write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
+            throw error
+        }
 
         // Run a forward pass with dummy tokens (just first 10 tokens)
         let promptTokens = MLXArray([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])[.newAxis, .ellipsis]
+        try? "STAGE:forwardStart".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
         let logits = model(promptTokens, cache: nil)
         eval(logits)
+        try? "STAGE:forwardDone shape=\(logits.shape)".write(toFile: "/tmp/dsv4_debug.txt", atomically: true, encoding: .utf8)
 
         XCTAssertEqual(logits.shape, [1, 10, config.vocabSize])
-        print("DeepSeek V4 forward pass OK: logits shape \(logits.shape)")
+        let resultMsg = "DeepSeek V4 forward pass OK: logits shape \(logits.shape)"
+        print(resultMsg)
+        // Write marker file so we can verify pass even if terminal output is truncated
+        try? resultMsg.write(toFile: "/tmp/deepseek_v4_result.txt", atomically: true, encoding: .utf8)
     }
 }
