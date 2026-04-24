@@ -145,9 +145,9 @@ public class Qwen3ModelInner: Module, LayerPartitionable {
     // LayerPartitionable
     public var gpuLayerCount: Int?
     public var totalLayerCount: Int { layers.count }
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3TransformerBlock]
+    let layers: [Qwen3TransformerBlock]
     let norm: RMSNorm
 
     public init(_ args: Qwen3Configuration) {
@@ -185,7 +185,7 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     public let model: Qwen3ModelInner
     let configuration: Qwen3Configuration
 
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear?
 
     public init(_ args: Qwen3Configuration) {
         self.configuration = args
@@ -206,6 +206,29 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    public func callCapturing(
+        _ inputs: MLXArray, cache: [KVCache?]? = nil, captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
+        var h = model.embedTokens(inputs)
+        let layerCount = model.layers.count
+        let kvCache: [KVCache?] = {
+            guard let c = cache else { return Array(repeating: nil, count: layerCount) }
+            var normalized: [KVCache?] = Array(repeating: nil, count: layerCount)
+            for (i, v) in c.prefix(layerCount).enumerated() { normalized[i] = v }
+            return normalized
+        }()
+        let mask = createAttentionMask(h: h, cache: kvCache.first ?? nil)
+        var captured: [Int: MLXArray] = [:]
+        for (i, layer) in model.layers.enumerated() {
+            h = partitionedLayerCall(index: i, gpuLayerCount: model.gpuLayerCount) {
+                layer(h, mask: mask, cache: kvCache[i])
+            }
+            if captureLayerIDs.contains(i) { captured[i] = h }
+        }
+        h = model.norm(h)
+        return (h, captured)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
