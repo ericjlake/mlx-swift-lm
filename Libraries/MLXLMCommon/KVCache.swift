@@ -4,6 +4,14 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Offset to use with ``applyRotaryPosition(_:to:offset:)``.
+///
+/// See ``KVCache/ropeOffset``.
+public enum RoPEOffset {
+    case scalar(Int)
+    case batch(MLXArray)
+}
+
 /// Implementation of KV cache functionality for MLX Swift
 ///
 ///
@@ -38,6 +46,9 @@ import MLXNN
 public protocol KVCache: Evaluatable {
     /// get the current offset
     var offset: Int { get }
+
+    /// Offset to use with ``applyRotaryPosition(_:to:offset:)``.
+    var ropeOffset: RoPEOffset { get }
 
     /// get the maximum size (if any)
     var maxSize: Int? { get }
@@ -74,6 +85,12 @@ public protocol KVCache: Evaluatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+}
+
+extension KVCache {
+    public var ropeOffset: RoPEOffset {
+        .scalar(offset)
+    }
 }
 
 /// Protocol for caches that support efficient quantized operations
