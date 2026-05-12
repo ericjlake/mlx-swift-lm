@@ -6,7 +6,7 @@ import MLXNN
 
 /// Pairwise Givens rotation kernel for Metal (Apple Silicon).
 /// Template parameters are substituted at compile time.
-nonisolated private func metalSource(
+private func metalSource(
     rowsPerTile: Int, maxGroupSize: Int = 128, maxKrot: Int = 16
 ) -> String {
     """
@@ -137,7 +137,7 @@ nonisolated private func packPairs(_ pairs: MLXArray, groupSize: Int) -> MLXArra
 ///
 /// Rotation is applied to activations at runtime via a Metal kernel, preserving
 /// the quantization-friendly properties of the original weights.
-nonisolated open class RotateQuantizedLinear: QuantizedLinear {
+open class RotateQuantizedLinear: QuantizedLinear {
 
     // Rotation parameters — discovered by Module reflection for update(parameters:).
     // `channelScales` uses @ParameterInfo so it can keep the snake_case checkpoint

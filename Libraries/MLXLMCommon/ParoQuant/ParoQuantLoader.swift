@@ -341,11 +341,12 @@ private struct ParoQuantInputProcessor: UserInputProcessor {
 /// - Parameters:
 ///   - directory: Local path to the model checkpoint directory.
 ///   - typeRegistry: Registry used to create the underlying model architecture.
+///   - tokenizerLoader: Loader for tokenizer.
 ///   - toolCallFormat: Optional tool-call format for the model configuration.
 /// - Returns: A ``ModelContainer`` ready for inference.
-public func loadParoQuantModel(
+public func loadParoQuantModel<T: LanguageModel>(
     from directory: URL,
-    typeRegistry: ModelTypeRegistry,
+    typeRegistry: ModelTypeRegistry<T>,
     tokenizerLoader: any TokenizerLoader,
     toolCallFormat: ToolCallFormat? = nil
 ) async throws -> ModelContainer {
