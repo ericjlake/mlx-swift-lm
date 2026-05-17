@@ -45,11 +45,14 @@ extension LLMModel {
         while y.tokens.size > prefillStepSize {
             let input = y[.newAxis, ..<prefillStepSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
-            eval(cache)
+            asyncEval(cache)
             y = y[prefillStepSize...]
             processed += prefillStepSize
             activePrefillProgressHook?(processed, totalTokens)
         }
+
+        // Single sync after the loop to flush any remaining async work.
+        eval(cache)
 
         return .tokens(y)
     }
